@@ -5,6 +5,7 @@ import logging
 import tempfile
 import shutil
 from pathlib import Path
+from typing import List, Tuple, Optional, Callable, Any
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -45,13 +46,51 @@ QUALITY_OPTIONS = [
     ("🔊 Audio only (MP3)", "bestaudio/best"),
 ]
 
-# ── Hardcoded browser cookies (Flatpak Chrome) ────────────────────────────────
-# yt-dlp will read cookies directly from this browser profile
-COOKIES_FROM_BROWSER = ("chrome", "~/.var/app/com.google.Chrome")
+# ── Multi‑browser cookie fallback ─────────────────────────────────────────────
+# Each entry: (browser_name, profile_path_or_None)
+# yt-dlp will try them in order until one succeeds.
+COOKIE_BROWSERS: List[Tuple[str, Optional[str]]] = [
+    ("chrome", "~/.var/app/com.google.Chrome"),   # Flatpak Chrome
+    ("chrome", None),                             # default Chrome profile
+    ("firefox", None),                            # default Firefox
+    ("brave", None),                              # default Brave
+]
 
-def _add_browser_cookies(opts: dict) -> None:
-    """Add cookiesfrombrowser option to yt-dlp opts dict."""
-    opts["cookiesfrombrowser"] = COOKIES_FROM_BROWSER
+def _browser_to_ydl_arg(browser: str, profile: Optional[str]) -> Any:
+    """Convert (browser, profile) to format accepted by yt-dlp cookiesfrombrowser."""
+    if profile:
+        return (browser, profile)
+    return browser
+
+async def run_ydl_with_cookie_fallback(
+    opts_factory: Callable[[], dict],
+    func: Callable[[yt_dlp.YoutubeDL], Any],
+    *args,
+    **kwargs
+) -> Any:
+    """
+    Execute a yt-dlp operation with cookie fallback.
+    - opts_factory: function that returns base yt-dlp options (without cookiesfrombrowser)
+    - func: function that receives a YoutubeDL instance and does the actual work
+    - Returns the result of func(ydl)
+    - Raises the last exception if all browsers fail.
+    """
+    last_exception = None
+    for browser, profile in COOKIE_BROWSERS:
+        opts = opts_factory()
+        try:
+            # Add cookiesfrombrowser to this attempt
+            opts["cookiesfrombrowser"] = _browser_to_ydl_arg(browser, profile)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                logger.info("Trying cookies from browser: %s %s", browser, profile or "")
+                result = func(ydl, *args, **kwargs)
+                logger.info("Success with %s %s", browser, profile or "")
+                return result
+        except Exception as e:
+            logger.warning("Failed with %s %s: %s", browser, profile or "", e)
+            last_exception = e
+            continue
+    raise RuntimeError(f"All cookie browsers failed. Last error: {last_exception}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
@@ -63,15 +102,12 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
 def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
 
-def _build_ydl_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
+def base_ydl_opts(tmpdir: str = None, fmt: str = None, audio_only: bool = False) -> dict:
+    """Return base yt-dlp options (without cookies)."""
     opts = {
-        "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
         "quiet":               True,
         "no_warnings":         True,
         "noprogress":          True,
-        "format":              fmt,
-        "merge_output_format": "mp4",
-        "postprocessors":      [],
         "socket_timeout":      30,
         "retries":             5,
         "fragment_retries":    5,
@@ -84,32 +120,44 @@ def _build_ydl_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
             )
         },
     }
-    if audio_only:
-        opts["postprocessors"].append({
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        })
-        opts.pop("merge_output_format", None)
-
-    # Add browser cookies for all yt-dlp calls
-    _add_browser_cookies(opts)
+    if tmpdir and fmt is not None:
+        opts["outtmpl"] = os.path.join(tmpdir, "%(title).80s.%(ext)s")
+        opts["format"] = fmt
+        opts["merge_output_format"] = "mp4"
+        if audio_only:
+            opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
+            opts.pop("merge_output_format", None)
+        else:
+            opts["postprocessors"] = []
     return opts
 
-def fetch_info(url: str) -> dict:
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    _add_browser_cookies(opts)
-    with yt_dlp.YoutubeDL(opts) as ydl:
+def fetch_info_sync(url: str) -> dict:
+    """Synchronous fetch info using yt-dlp (will be called via executor)."""
+    def _fetch(ydl: yt_dlp.YoutubeDL):
         return ydl.extract_info(url, download=False)
 
-def download_video(url: str, fmt: str, tmpdir: str) -> Path:
+    return run_ydl_with_cookie_fallback(
+        lambda: base_ydl_opts(),  # no tmpdir/fmt needed for info
+        _fetch
+    )
+
+def download_video_sync(url: str, fmt: str, tmpdir: str) -> Path:
+    """Synchronous download using yt-dlp."""
     audio_only = fmt.startswith("bestaudio")
-    with yt_dlp.YoutubeDL(_build_ydl_opts(tmpdir, fmt, audio_only)) as ydl:
+
+    def _download(ydl: yt_dlp.YoutubeDL):
         ydl.extract_info(url, download=True)
-    candidates = sorted(Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError("yt-dlp produced no output file")
-    return candidates[0]
+        candidates = sorted(Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise FileNotFoundError("yt-dlp produced no output file")
+        return candidates[0]
+
+    opts_factory = lambda: base_ydl_opts(tmpdir, fmt, audio_only)
+    return run_ydl_with_cookie_fallback(opts_factory, _download)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -132,14 +180,14 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    browser, profile = COOKIES_FROM_BROWSER
-    await update.message.reply_text(
-        f"🍪 *Cookie Status*\n"
-        f"✅ Using `--cookies-from-browser {browser}:{profile}`\n\n"
-        "Cookies are extracted live from your Chrome (Flatpak) browser profile.\n"
-        "No manual `cookies.txt` needed.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    lines = ["🍪 *Cookie Sources (fallback order)*\n"]
+    for browser, profile in COOKIE_BROWSERS:
+        if profile:
+            lines.append(f"• `{browser}:{profile}`")
+        else:
+            lines.append(f"• `{browser}` (default profile)")
+    lines.append("\n✅ The bot tries each in order until one works.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -153,9 +201,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     msg = await update.message.reply_text("🔍 Fetching video info…")
     try:
-        info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, text)
-    except yt_dlp.utils.DownloadError as e:
-        await msg.edit_text(f"❌ Could not fetch info:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        info = await asyncio.get_event_loop().run_in_executor(None, fetch_info_sync, text)
+    except Exception as e:
+        await msg.edit_text(f"❌ Could not fetch info (all cookie sources failed):\n`{e}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     title   = info.get("title", "Unknown")
@@ -191,7 +239,7 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
     try:
         file_path: Path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, url, fmt, tmpdir
+            None, download_video_sync, url, fmt, tmpdir
         )
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
@@ -239,7 +287,7 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    logger.info("Using browser cookies: %s:%s", *COOKIES_FROM_BROWSER)
+    logger.info("Cookie fallback browsers: %s", COOKIE_BROWSERS)
 
     app = (
         Application.builder()
