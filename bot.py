@@ -30,11 +30,6 @@ MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
 DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "/tmp/yt_downloads")
 ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
 
-# New: browser cookies configuration
-# Format: "browser" or "browser:/path/to/profile"
-# Example: "chrome:~/.var/app/com.google.Chrome"
-BROWSER_COOKIES = os.getenv("BROWSER_COOKIES", "")
-
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 YOUTUBE_REGEX = re.compile(
@@ -50,17 +45,13 @@ QUALITY_OPTIONS = [
     ("🔊 Audio only (MP3)", "bestaudio/best"),
 ]
 
-# ── Browser cookies helper ────────────────────────────────────────────────────
-def get_browser_cookies():
-    """
-    Returns a tuple (browser_name, profile_dir) or None if BROWSER_COOKIES is empty.
-    """
-    if not BROWSER_COOKIES:
-        return None
-    parts = BROWSER_COOKIES.split(":", 1)
-    browser = parts[0].strip()
-    profile = parts[1].strip() if len(parts) > 1 else None
-    return (browser, profile)
+# ── Hardcoded browser cookies (Flatpak Chrome) ────────────────────────────────
+# yt-dlp will read cookies directly from this browser profile
+COOKIES_FROM_BROWSER = ("chrome", "~/.var/app/com.google.Chrome")
+
+def _add_browser_cookies(opts: dict) -> None:
+    """Add cookiesfrombrowser option to yt-dlp opts dict."""
+    opts["cookiesfrombrowser"] = COOKIES_FROM_BROWSER
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
@@ -101,20 +92,13 @@ def _build_ydl_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
         })
         opts.pop("merge_output_format", None)
 
-    # Use browser cookies if configured
-    browser_cookies = get_browser_cookies()
-    if browser_cookies:
-        browser, profile = browser_cookies
-        opts["cookiesfrombrowser"] = (browser, profile) if profile else (browser,)
-
+    # Add browser cookies for all yt-dlp calls
+    _add_browser_cookies(opts)
     return opts
 
 def fetch_info(url: str) -> dict:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    browser_cookies = get_browser_cookies()
-    if browser_cookies:
-        browser, profile = browser_cookies
-        opts["cookiesfrombrowser"] = (browser, profile) if profile else (browser,)
+    _add_browser_cookies(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -148,17 +132,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    browser_info = get_browser_cookies()
-    if browser_info:
-        browser, profile = browser_info
-        profile_msg = f" (profile: `{profile}`)" if profile else ""
-        status = f"✅ Using `--cookies-from-browser {browser}`{profile_msg}"
-    else:
-        status = "❌ No browser cookies configured. Set `BROWSER_COOKIES` environment variable."
+    browser, profile = COOKIES_FROM_BROWSER
     await update.message.reply_text(
-        f"🍪 *Cookie Status*\n{status}\n\n"
-        "This bot uses yt-dlp's native browser cookie extraction.\n"
-        "No manual `cookies.txt` required.",
+        f"🍪 *Cookie Status*\n"
+        f"✅ Using `--cookies-from-browser {browser}:{profile}`\n\n"
+        "Cookies are extracted live from your Chrome (Flatpak) browser profile.\n"
+        "No manual `cookies.txt` needed.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -260,12 +239,7 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    browser_info = get_browser_cookies()
-    if browser_info:
-        browser, profile = browser_info
-        logger.info("Browser cookies: %s%s", browser, f" (profile: {profile})" if profile else "")
-    else:
-        logger.info("No browser cookies configured. Set BROWSER_COOKIES env var to enable.")
+    logger.info("Using browser cookies: %s:%s", *COOKIES_FROM_BROWSER)
 
     app = (
         Application.builder()
