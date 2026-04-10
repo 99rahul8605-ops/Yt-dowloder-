@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to .env and fill in your values.
+#   cp .env.example .env
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── REQUIRED ─────────────────────────────────────────────────────────────────
+
+# Your Telegram Bot Token (from @BotFather)
+BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
+
+# ── OPTIONAL ─────────────────────────────────────────────────────────────────
+
+# Maximum video size in MB the bot will attempt to send (Telegram hard limit = 50)
+MAX_SIZE_MB=50
+
+# Comma-separated list of Telegram user IDs who may use the bot.
+# Find your ID by messaging @userinfobot.
+# Leave blank to allow all users.
+ALLOWED_USERS=
+
+# Example (restrict to two users):
+# ALLOWED_USERS=123456789,987654321
+
