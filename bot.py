@@ -26,10 +26,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
-COOKIES_FILE  = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
 DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "/tmp/yt_downloads")
 ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
+
+# New: browser cookies configuration
+# Format: "browser" or "browser:/path/to/profile"
+# Example: "chrome:~/.var/app/com.google.Chrome"
+BROWSER_COOKIES = os.getenv("BROWSER_COOKIES", "")
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -46,61 +50,17 @@ QUALITY_OPTIONS = [
     ("🔊 Audio only (MP3)", "bestaudio/best"),
 ]
 
-# ── Cookie sanitizer ──────────────────────────────────────────────────────────
-NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
-_SANITIZED_COOKIES = None
-
-
-def _sanitize_cookies(src: str) -> str:
+# ── Browser cookies helper ────────────────────────────────────────────────────
+def get_browser_cookies():
     """
-    Strip BOM, normalize line endings, ensure magic header is on line 1,
-    write to /tmp/_yt_bot_cookies.txt and return that path.
+    Returns a tuple (browser_name, profile_dir) or None if BROWSER_COOKIES is empty.
     """
-    raw = Path(src).read_bytes()
-
-    # Strip UTF-8 BOM
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
-
-    text = raw.decode("utf-8", errors="replace")
-    # Normalize line endings
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    lines = text.splitlines()
-
-    # Remove any pre-existing magic header lines (we'll re-add cleanly)
-    lines = [l for l in lines if NETSCAPE_MAGIC not in l]
-
-    # Build final content: magic header MUST be first line
-    clean = NETSCAPE_MAGIC + "\n" + "\n".join(lines) + "\n"
-
-    data_lines = [l for l in lines if l.strip() and not l.startswith("#")]
-    if not data_lines:
-        raise ValueError("cookies.txt has no cookie data lines")
-
-    dst = "/tmp/_yt_bot_cookies.txt"
-    Path(dst).write_text(clean, encoding="utf-8")
-    logger.info("Cookies sanitized → %s  (%d entries)", dst, len(data_lines))
-    return dst
-
-
-def get_cookies_path():
-    global _SANITIZED_COOKIES
-    if _SANITIZED_COOKIES:
-        return _SANITIZED_COOKIES
-    if not os.path.isfile(COOKIES_FILE):
-        logger.warning("No cookies file at %s", COOKIES_FILE)
+    if not BROWSER_COOKIES:
         return None
-    if os.path.getsize(COOKIES_FILE) == 0:
-        logger.warning("cookies.txt is empty")
-        return None
-    try:
-        _SANITIZED_COOKIES = _sanitize_cookies(COOKIES_FILE)
-        return _SANITIZED_COOKIES
-    except Exception as exc:
-        logger.error("Cookie sanitization failed: %s", exc)
-        return None
-
+    parts = BROWSER_COOKIES.split(":", 1)
+    browser = parts[0].strip()
+    profile = parts[1].strip() if len(parts) > 1 else None
+    return (browser, profile)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
@@ -109,10 +69,8 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
         for label, fmt in QUALITY_OPTIONS
     ])
 
-
 def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
-
 
 def _build_ydl_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
     opts = {
@@ -143,20 +101,22 @@ def _build_ydl_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
         })
         opts.pop("merge_output_format", None)
 
-    cp = get_cookies_path()
-    if cp:
-        opts["cookiefile"] = cp
-    return opts
+    # Use browser cookies if configured
+    browser_cookies = get_browser_cookies()
+    if browser_cookies:
+        browser, profile = browser_cookies
+        opts["cookiesfrombrowser"] = (browser, profile) if profile else (browser,)
 
+    return opts
 
 def fetch_info(url: str) -> dict:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    cp = get_cookies_path()
-    if cp:
-        opts["cookiefile"] = cp
+    browser_cookies = get_browser_cookies()
+    if browser_cookies:
+        browser, profile = browser_cookies
+        opts["cookiesfrombrowser"] = (browser, profile) if profile else (browser,)
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
-
 
 def download_video(url: str, fmt: str, tmpdir: str) -> Path:
     audio_only = fmt.startswith("bestaudio")
@@ -166,7 +126,6 @@ def download_video(url: str, fmt: str, tmpdir: str) -> Path:
     if not candidates:
         raise FileNotFoundError("yt-dlp produced no output file")
     return candidates[0]
-
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -178,7 +137,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
 
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *How to use*\n\n"
@@ -187,25 +145,22 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
 
-
 async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    cp = get_cookies_path()
-    if cp:
-        data_lines = [
-            l for l in Path(cp).read_text().splitlines()
-            if l.strip() and not l.startswith("#")
-        ]
-        status = f"✅ Active — {len(data_lines)} cookies loaded"
+    browser_info = get_browser_cookies()
+    if browser_info:
+        browser, profile = browser_info
+        profile_msg = f" (profile: `{profile}`)" if profile else ""
+        status = f"✅ Using `--cookies-from-browser {browser}`{profile_msg}"
     else:
-        src_ok = os.path.isfile(COOKIES_FILE)
-        status = f"❌ Not loaded  (file exists: {src_ok})"
+        status = "❌ No browser cookies configured. Set `BROWSER_COOKIES` environment variable."
     await update.message.reply_text(
-        f"🍪 *Cookie Status*\nPath: `{COOKIES_FILE}`\n{status}",
+        f"🍪 *Cookie Status*\n{status}\n\n"
+        "This bot uses yt-dlp's native browser cookie extraction.\n"
+        "No manual `cookies.txt` required.",
         parse_mode=ParseMode.MARKDOWN,
     )
-
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -234,7 +189,6 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=quality_keyboard(text),
     )
-
 
 async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -304,11 +258,14 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    cp = get_cookies_path()
-    logger.info("Cookie auth: %s", f"ACTIVE ({cp})" if cp else "DISABLED")
+    browser_info = get_browser_cookies()
+    if browser_info:
+        browser, profile = browser_info
+        logger.info("Browser cookies: %s%s", browser, f" (profile: {profile})" if profile else "")
+    else:
+        logger.info("No browser cookies configured. Set BROWSER_COOKIES env var to enable.")
 
     app = (
         Application.builder()
@@ -326,7 +283,6 @@ def main() -> None:
 
     logger.info("Bot polling…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
