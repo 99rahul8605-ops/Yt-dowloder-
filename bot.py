@@ -64,13 +64,18 @@ QUALITY_OPTIONS = [
 ]
 
 # ----------------------------------------------------------------------
-# Cookie sources (browsers + optional manual file)
+# Cookie sources – strings for --cookies-from-browser
 # ----------------------------------------------------------------------
-COOKIE_BROWSERS: List[Tuple[str, Optional[str]]] = [
-    ("chrome", "~/.var/app/com.google.Chrome"),   # Flatpak Chrome
-    ("chrome", None),                             # default Chrome profile
-    ("firefox", None),                            # default Firefox
-    ("brave", None),                              # default Brave
+def _expand_path(p: str) -> str:
+    """Expand ~ to user's home directory."""
+    return os.path.expanduser(p)
+
+# Each entry is a string that yt-dlp understands for --cookies-from-browser
+COOKIE_BROWSER_STRINGS = [
+    f"chrome:{_expand_path('~/.var/app/com.google.Chrome')}",   # Flatpak Chrome
+    "chrome",                                                    # default Chrome profile
+    "firefox",                                                   # default Firefox
+    "brave",                                                     # default Brave
 ]
 
 def is_manual_cookies_available() -> bool:
@@ -110,17 +115,13 @@ def normalize_cookies_file() -> Optional[str]:
 def get_cookie_args() -> List[Tuple[str, Any]]:
     """
     Return a list of (method, argument) pairs to try, in order.
-    Each argument is either:
-      - a tuple for cookiesfrombrowser, or
-      - a string path for cookiefile.
+    For browsers: method='cookiesfrombrowser', argument is a string.
+    For manual file: method='cookiefile', argument is the normalized path.
     """
     args = []
     # Browser methods
-    for browser, profile in COOKIE_BROWSERS:
-        if profile:
-            args.append(("cookiesfrombrowser", (browser, profile)))
-        else:
-            args.append(("cookiesfrombrowser", browser))
+    for browser_str in COOKIE_BROWSER_STRINGS:
+        args.append(("cookiesfrombrowser", browser_str))
     # Manual file method (if available and valid)
     manual_path = normalize_cookies_file()
     if manual_path:
@@ -128,7 +129,7 @@ def get_cookie_args() -> List[Tuple[str, Any]]:
     return args
 
 # ----------------------------------------------------------------------
-# Synchronous cookie fallback (FIXED: no async)
+# Synchronous cookie fallback
 # ----------------------------------------------------------------------
 def run_ydl_with_cookie_fallback(
     opts_factory: Callable[[], dict],
@@ -150,8 +151,7 @@ def run_ydl_with_cookie_fallback(
             opts[method] = arg
             with yt_dlp.YoutubeDL(opts) as ydl:
                 if method == "cookiesfrombrowser":
-                    browser_info = arg if isinstance(arg, str) else f"{arg[0]}:{arg[1]}"
-                    logger.info("Trying cookie source: browser %s", browser_info)
+                    logger.info("Trying cookie source: browser %s", arg)
                 else:
                     logger.info("Trying cookie source: manual file %s", arg)
                 result = func(ydl, *args, **kwargs)
@@ -255,10 +255,7 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["🍪 *Cookie Sources (fallback order)*\n"]
     for method, arg in get_cookie_args():
         if method == "cookiesfrombrowser":
-            if isinstance(arg, tuple):
-                lines.append(f"• Browser: `{arg[0]}:{arg[1]}`")
-            else:
-                lines.append(f"• Browser: `{arg}` (default profile)")
+            lines.append(f"• Browser: `{arg}`")
         else:
             lines.append(f"• Manual file: `{arg}`")
     lines.append("\n✅ The bot tries each source in order until one works.")
@@ -284,11 +281,10 @@ async def cmd_export_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("🍪 Attempting to export cookies from browser…")
     export_path = "/tmp/exported_cookies.txt"
     try:
-        first_browser, first_profile = COOKIE_BROWSERS[0]
-        browser_arg = f"{first_browser}:{first_profile}" if first_profile else first_browser
+        first_browser_str = COOKIE_BROWSER_STRINGS[0]
         def export():
             opts = {
-                "cookiesfrombrowser": browser_arg,
+                "cookiesfrombrowser": first_browser_str,
                 "cookiefile": export_path,
                 "quiet": True,
                 "no_warnings": True,
