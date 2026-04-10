@@ -127,7 +127,10 @@ def get_cookie_args() -> List[Tuple[str, Any]]:
         args.append(("cookiefile", manual_path))
     return args
 
-async def run_ydl_with_cookie_fallback(
+# ----------------------------------------------------------------------
+# Synchronous cookie fallback (FIXED: no async)
+# ----------------------------------------------------------------------
+def run_ydl_with_cookie_fallback(
     opts_factory: Callable[[], dict],
     func: Callable[[yt_dlp.YoutubeDL], Any],
     *args,
@@ -209,23 +212,17 @@ def fetch_info_sync(url: str) -> dict:
     """Synchronous fetch info using yt-dlp (will be called via executor)."""
     def _fetch(ydl: yt_dlp.YoutubeDL):
         return ydl.extract_info(url, download=False)
-
-    return run_ydl_with_cookie_fallback(
-        lambda: base_ydl_opts(),
-        _fetch
-    )
+    return run_ydl_with_cookie_fallback(lambda: base_ydl_opts(), _fetch)
 
 def download_video_sync(url: str, fmt: str, tmpdir: str) -> Path:
     """Synchronous download using yt-dlp."""
     audio_only = fmt.startswith("bestaudio")
-
     def _download(ydl: yt_dlp.YoutubeDL):
         ydl.extract_info(url, download=True)
         candidates = sorted(Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         if not candidates:
             raise FileNotFoundError("yt-dlp produced no output file")
         return candidates[0]
-
     opts_factory = lambda: base_ydl_opts(tmpdir, fmt, audio_only)
     return run_ydl_with_cookie_fallback(opts_factory, _download)
 
@@ -417,13 +414,11 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 # Webhook & Health check
 # ----------------------------------------------------------------------
 async def health_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Simple health check endpoint for uptime monitoring."""
+    """Simple health check command for uptime monitoring."""
     await update.message.reply_text("✅ Bot is alive and well!")
 
 def setup_webhook(app: Application) -> None:
     """Configure webhook with a health check and the Telegram webhook path."""
-    from telegram.ext import Updater  # noqa: F401
-    # Add a command handler for /health (optional)
     app.add_handler(CommandHandler("health", health_check))
     # Start the webhook
     app.run_webhook(
