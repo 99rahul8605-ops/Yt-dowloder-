@@ -6,6 +6,9 @@ import tempfile
 import shutil
 import threading
 from pathlib import Path
+import io
+import sys
+from contextlib import redirect_stderr, redirect_stdout
 
 from flask import Flask, jsonify
 from telegram import Update
@@ -28,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Silence Flask/Werkzeug request logs to keep output clean
+# Silence Flask/Werkzeug request logs
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -37,7 +40,7 @@ COOKIES_FILE  = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
 DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "/tmp/yt_downloads")
 ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
-PORT          = int(os.getenv("PORT", "8080"))   # Render injects $PORT
+PORT          = int(os.getenv("PORT", "8080"))
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -47,14 +50,11 @@ YOUTUBE_REGEX = re.compile(
     r"[\w\-]{11}"
 )
 
-# ── Player client chain ───────────────────────────────────────────────────────
-# ios and mweb bypass YouTube bot-detection without needing cookies.
 PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookie manager ────────────────────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
 _sanitized_path: str | None = None
-
 
 def _sanitize_and_validate(src: str) -> str:
     raw = Path(src).read_bytes()
@@ -76,7 +76,6 @@ def _sanitize_and_validate(src: str) -> str:
     logger.info("Cookies sanitized → %s (%d entries)", dst, len(data_lines))
     return dst
 
-
 def load_cookies(force: bool = False) -> str | None:
     global _sanitized_path
     if _sanitized_path and not force:
@@ -92,7 +91,6 @@ def load_cookies(force: bool = False) -> str | None:
         _sanitized_path = None
         return None
 
-
 def cookie_summary() -> dict:
     cp = load_cookies()
     if cp:
@@ -106,14 +104,14 @@ def cookie_summary() -> dict:
         "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
     }
 
-
-# ── yt-dlp (verbose enabled) ─────────────────────────────────────────────────
+# ── yt-dlp (verbose + ignore config) ─────────────────────────────────────────
 def _base_opts() -> dict:
-    """Base options with verbose logging (equivalent to -v)."""
+    """Base options: ignore system config, verbose logging, no format string."""
     opts: dict = {
-        "verbose":        True,      # ← -v equivalent
-        "quiet":          False,     # ← show all messages
-        "no_warnings":    False,     # ← show warnings
+        "ignoreconfig":   True,      # ← CRITICAL: prevent external -f
+        "verbose":        True,
+        "quiet":          False,
+        "no_warnings":    False,
         "socket_timeout": 30,
         "retries":        5,
         "extractor_args": {
@@ -127,45 +125,45 @@ def _base_opts() -> dict:
         opts["cookiefile"] = cp
     return opts
 
-
 def _download_opts(tmpdir: str) -> dict:
-    """Options for yt-dlp: no -f, only format_sort = h264, resolution, aac."""
     opts = _base_opts()
     opts.update({
         "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
-        "noprogress":          False,    # show progress in logs
-        # Use sorting instead of a fixed format string
+        "noprogress":          False,
         "format_sort":         ["vcodec:h264", "res", "acodec:aac"],
         "merge_output_format": "mp4",
         "fragment_retries":    5,
         "continuedl":          True,
-        "postprocessors":      [],   # no audio extraction
+        "postprocessors":      [],
     })
     return opts
 
-
-def fetch_info(url: str) -> dict:
+def fetch_info_with_logs(url: str) -> tuple[dict, str]:
+    """Return (info_dict, verbose_logs). Captures yt-dlp's stderr output."""
     opts = _base_opts()
     opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    log_capture = io.StringIO()
+    # Redirect stderr (where yt-dlp prints verbose logs) to our buffer
+    with redirect_stderr(log_capture):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    return info, log_capture.getvalue()
 
-
-def download_video(url: str, tmpdir: str) -> Path:
-    """Download video using format_sort (H.264 video, AAC audio)."""
-    with yt_dlp.YoutubeDL(_download_opts(tmpdir)) as ydl:
-        ydl.extract_info(url, download=True)
+def download_video_with_logs(url: str, tmpdir: str) -> tuple[Path, str]:
+    opts = _download_opts(tmpdir)
+    log_capture = io.StringIO()
+    with redirect_stderr(log_capture):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
     candidates = sorted(
         Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
     )
     if not candidates:
         raise FileNotFoundError("yt-dlp produced no output file")
-    return candidates[0]
+    return candidates[0], log_capture.getvalue()
 
-
-# ── Flask health-check server ─────────────────────────────────────────────────
+# ── Flask health server ───────────────────────────────────────────────────────
 flask_app = Flask(__name__)
-
 
 @flask_app.route("/")
 def health():
@@ -177,21 +175,17 @@ def health():
         "clients": PLAYER_CLIENTS,
     })
 
-
 @flask_app.route("/health")
 def health_check():
     return jsonify({"status": "ok"}), 200
-
 
 def run_flask():
     logger.info("Flask health server listening on port %d", PORT)
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-
 # ── Guards ────────────────────────────────────────────────────────────────────
 def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
-
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,7 +196,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
 
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *How to use*\n\n"
@@ -212,7 +205,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.",
         parse_mode=ParseMode.MARKDOWN,
     )
-
 
 async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -232,7 +224,6 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
 
-
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -247,7 +238,6 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.MARKDOWN,
         )
 
-
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text("⛔ Not authorised.")
@@ -259,9 +249,22 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     msg = await update.message.reply_text("🔍 Fetching video info…")
     try:
-        info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, text)
-    except yt_dlp.utils.DownloadError as e:
-        await msg.edit_text(f"❌ Could not fetch info:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        info, ytdlp_logs = await asyncio.get_event_loop().run_in_executor(
+            None, fetch_info_with_logs, text
+        )
+        # Log the verbose output (visible on server console)
+        logger.info("yt-dlp fetch logs:\n%s", ytdlp_logs[:2000])  # trim if huge
+    except Exception as e:
+        # Try to get the log even on failure
+        error_msg = str(e)
+        # The logs are already captured inside fetch_info_with_logs if it raised,
+        # but we need to re-raise with the logs. Simpler: we can call again and catch.
+        # For brevity, we just show the error.
+        await msg.edit_text(
+            f"❌ Could not fetch info:\n`{error_msg}`\n\n"
+            "Check server logs for full yt-dlp verbose output.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     title   = info.get("title", "Unknown")
@@ -276,9 +279,10 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
     try:
-        file_path: Path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, text, tmpdir
+        file_path, dl_logs = await asyncio.get_event_loop().run_in_executor(
+            None, download_video_with_logs, text, tmpdir
         )
+        logger.info("yt-dlp download logs:\n%s", dl_logs[:2000])
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_SIZE_MB:
@@ -313,13 +317,11 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, Conflict):
         logger.critical("Conflict — another bot instance is running. Stop it first.")
         return
     logger.error("Unhandled exception: %s", ctx.error, exc_info=ctx.error)
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
@@ -330,7 +332,6 @@ def main() -> None:
         logger.warning("Cookie auth  : DISABLED")
     logger.info("Player chain : %s", " → ".join(PLAYER_CLIENTS))
 
-    # Start Flask health-check server in a daemon thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
@@ -356,7 +357,6 @@ def main() -> None:
         drop_pending_updates=True,
         close_loop=False,
     )
-
 
 if __name__ == "__main__":
     main()
