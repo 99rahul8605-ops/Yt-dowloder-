@@ -5,6 +5,7 @@ import logging
 import tempfile
 import shutil
 import threading
+import subprocess
 from pathlib import Path
 
 from flask import Flask, jsonify
@@ -48,8 +49,6 @@ QUALITY_OPTIONS = [
     ("🔊 Audio only MP3", None, True),
 ]
 
-# ios returns "Untested" format 270 (HLS) which may not download.
-# Use web-based clients only — they return tested, standard streams.
 PLAYER_CLIENTS = ["mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookies ───────────────────────────────────────────────────────────────────
@@ -95,8 +94,32 @@ def cookie_summary() -> dict:
             "exists": os.path.isfile(COOKIES_FILE),
             "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0}
 
-# ── yt-dlp ────────────────────────────────────────────────────────────────────
-def _base_opts() -> dict:
+# ── ffprobe helper ────────────────────────────────────────────────────────────
+def ffprobe_info(path: str) -> dict:
+    """Use ffprobe to read codec/resolution/duration of a downloaded file."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        logger.warning("ffprobe failed: %s", result.stderr.strip())
+        return {}
+    import json
+    return json.loads(result.stdout)
+
+def get_video_resolution(path: str) -> tuple[int, int]:
+    """Return (width, height) of a video file using ffprobe."""
+    info = ffprobe_info(path)
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") == "video":
+            return stream.get("width", 0), stream.get("height", 0)
+    return 0, 0
+
+# ── yt-dlp: extract stream URLs only ─────────────────────────────────────────
+def _ydl_base_opts() -> dict:
     opts: dict = {
         "quiet":          True,
         "no_warnings":    True,
@@ -109,65 +132,184 @@ def _base_opts() -> dict:
         opts["cookiefile"] = cp
     return opts
 
-def _download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dict:
-    """
-    format="b" selects a single best combined stream (never fails).
-    format_sort influences which "best" is chosen (h264 > other codecs).
-    remux_video="mp4" remuxes the result to mp4 via ffmpeg.
-
-    Why "b" and not bestvideo+bestaudio:
-      - bestvideo+bestaudio requires DASH separate streams → fails on HLS-only videos
-      - "b" = best single stream, always available regardless of protocol
-    """
-    opts = _base_opts()
-    opts.update({
-        "outtmpl":          os.path.join(tmpdir, "%(title).80s.%(ext)s"),
-        "noprogress":       True,
-        "fragment_retries": 5,
-        "continuedl":       True,
-        "postprocessors":   [],
-    })
-
-    if audio_only:
-        opts["format"]      = "ba/b"          # best audio stream, fallback to best
-        opts["format_sort"] = ["acodec:aac", "abr"]
-        opts["postprocessors"].append({
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
-            "preferredquality": "192",
-        })
-    else:
-        # "b" = single best stream, never triggers "format not available"
-        # format_sort ranks available streams by preference before "b" picks the top one
-        opts["format"]      = "b"
-        opts["remux_video"] = "mp4"
-        sort = ["vcodec:h264", "acodec:aac"]
-        if max_height:
-            sort.insert(0, f"res:{max_height}")
-        opts["format_sort"] = sort
-
-    return opts
-
 def fetch_info(url: str) -> dict:
-    opts = _base_opts()
+    """Fetch video metadata without downloading anything."""
+    opts = _ydl_base_opts()
     opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
+def get_stream_urls(url: str, max_height: int | None, audio_only: bool) -> dict:
+    """
+    Use yt-dlp ONLY to resolve the direct stream URL(s).
+    Returns {"video_url": ..., "audio_url": ..., "title": ...}
+    or      {"combined_url": ..., "title": ...}
+
+    We never ask yt-dlp to download — ffmpeg handles all I/O.
+    """
+    opts = _ydl_base_opts()
+    opts["skip_download"] = True
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    title  = info.get("title", "video")
+    fmts   = info.get("formats", [])
+
+    # Filter out untested / DRM / unplayable formats
+    fmts = [f for f in fmts if f.get("url") and not f.get("drm")]
+
+    if audio_only:
+        # Pick best audio stream
+        audio_fmts = [f for f in fmts if f.get("acodec") != "none"
+                      and f.get("vcodec") in (None, "none", "")]
+        if not audio_fmts:
+            audio_fmts = fmts  # fallback: any stream
+        audio_fmts.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+        return {"combined_url": audio_fmts[0]["url"], "title": title, "ext": "mp3"}
+
+    # Separate video+audio (DASH)
+    video_fmts = [f for f in fmts
+                  if f.get("vcodec") not in (None, "none", "")
+                  and f.get("acodec") in (None, "none", "")]
+    audio_fmts = [f for f in fmts
+                  if f.get("acodec") not in (None, "none", "")
+                  and f.get("vcodec") in (None, "none", "")]
+
+    if video_fmts and audio_fmts:
+        # DASH available — pick best matching video + best audio
+        if max_height:
+            video_fmts = [f for f in video_fmts
+                          if (f.get("height") or 9999) <= max_height] or video_fmts
+        # Prefer h264, then sort by resolution
+        video_fmts.sort(
+            key=lambda f: (
+                1 if "avc" in (f.get("vcodec") or "") else 0,
+                f.get("height") or 0,
+            ),
+            reverse=True,
+        )
+        audio_fmts.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+        return {
+            "video_url": video_fmts[0]["url"],
+            "audio_url": audio_fmts[0]["url"],
+            "title":     title,
+            "ext":       "mp4",
+        }
+
+    # HLS / combined stream — pick best resolution match
+    combined = [f for f in fmts
+                if f.get("vcodec") not in (None, "none", "")
+                and f.get("acodec") not in (None, "none", "")]
+    if not combined:
+        combined = fmts  # absolute fallback
+    if max_height:
+        under = [f for f in combined if (f.get("height") or 9999) <= max_height]
+        if under:
+            combined = under
+    combined.sort(key=lambda f: f.get("height") or 0, reverse=True)
+    return {"combined_url": combined[0]["url"], "title": title, "ext": "mp4"}
+
+# ── ffmpeg download ───────────────────────────────────────────────────────────
+def ffmpeg_download(stream: dict, outdir: str) -> Path:
+    """
+    Use ffmpeg directly to download and encode the stream.
+    This completely bypasses yt-dlp's format availability check.
+
+    For DASH (separate video+audio):
+        ffmpeg -i video_url -i audio_url -c:v copy -c:a aac out.mp4
+
+    For HLS/combined:
+        ffmpeg -i combined_url -c:v copy -c:a aac out.mp4
+
+    For audio only:
+        ffmpeg -i combined_url -vn -c:a libmp3lame -q:a 2 out.mp3
+    """
+    safe_title = re.sub(r'[^\w\s\-.]', '', stream["title"])[:60].strip() or "video"
+    ext        = stream.get("ext", "mp4")
+    outpath    = os.path.join(outdir, f"{safe_title}.{ext}")
+
+    base_cmd = [
+        "ffmpeg", "-y",
+        "-loglevel", "warning",
+        "-hide_banner",
+    ]
+
+    if "video_url" in stream and "audio_url" in stream:
+        # DASH: separate video + audio → merge and re-encode audio to aac
+        cmd = base_cmd + [
+            "-i", stream["video_url"],
+            "-i", stream["audio_url"],
+            "-c:v", "copy",       # copy video stream as-is (already h264)
+            "-c:a", "aac",        # encode audio to aac
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            outpath,
+        ]
+    elif ext == "mp3":
+        # Audio only → extract and encode to mp3
+        cmd = base_cmd + [
+            "-i", stream["combined_url"],
+            "-vn",                # drop video
+            "-c:a", "libmp3lame",
+            "-q:a", "2",          # ~190 kbps VBR
+            outpath,
+        ]
+    else:
+        # HLS/combined → remux to mp4, copy streams
+        cmd = base_cmd + [
+            "-i", stream["combined_url"],
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            outpath,
+        ]
+
+    logger.info("ffmpeg cmd: %s", " ".join(cmd[:6]) + " …")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+    if result.returncode != 0:
+        logger.error("ffmpeg stderr:\n%s", result.stderr[-2000:])
+        raise RuntimeError(f"ffmpeg failed (code {result.returncode})")
+
+    if not os.path.isfile(outpath) or os.path.getsize(outpath) == 0:
+        raise FileNotFoundError("ffmpeg produced no output file")
+
+    # Log what we actually got using ffprobe
+    w, h = get_video_resolution(outpath) if ext != "mp3" else (0, 0)
+    size  = os.path.getsize(outpath) / (1024 * 1024)
+    logger.info("Output: %s  %dx%d  %.1f MB", Path(outpath).name, w, h, size)
+    return Path(outpath)
+
 def download_video(url: str, max_height: int | None, audio_only: bool, tmpdir: str) -> Path:
-    with yt_dlp.YoutubeDL(_download_opts(tmpdir, max_height, audio_only)) as ydl:
-        ydl.extract_info(url, download=True)
-    candidates = sorted(Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError("yt-dlp produced no output file")
-    return candidates[0]
+    """Full pipeline: yt-dlp resolves URLs → ffmpeg downloads and encodes."""
+    logger.info("Resolving stream URLs for %s (max_height=%s audio=%s)", url, max_height, audio_only)
+    stream = get_stream_urls(url, max_height, audio_only)
+    logger.info("Stream type: %s", "DASH" if "video_url" in stream else "combined/HLS")
+    return ffmpeg_download(stream, tmpdir)
 
 # ── Flask ─────────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.get("/")
 def index():
-    return jsonify({"status": "ok", "cookies": cookie_summary(), "clients": PLAYER_CLIENTS})
+    # Check ffmpeg/ffprobe availability
+    def check(bin_name):
+        try:
+            r = subprocess.run([bin_name, "-version"], capture_output=True, timeout=5)
+            first = r.stdout.decode().split("\n")[0] if r.stdout else "?"
+            return {"ok": r.returncode == 0, "version": first}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    return jsonify({
+        "status":  "ok",
+        "cookies": cookie_summary(),
+        "clients": PLAYER_CLIENTS,
+        "ffmpeg":  check("ffmpeg"),
+        "ffprobe": check("ffprobe"),
+    })
 
 @flask_app.get("/health")
 def health():
@@ -177,7 +319,7 @@ def run_flask():
     logger.info("Flask on port %d", PORT)
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
+# ── Keyboards / guards ────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(lbl, callback_data=f"{mh or 'None'}|{int(ao)}|{url}")]
@@ -295,11 +437,8 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
                 )
         await query.edit_message_text("✅ Done! Enjoy 🎉")
 
-    except yt_dlp.utils.DownloadError as e:
-        logger.error("DL error: %s", e)
-        await query.edit_message_text(f"❌ `{e}`", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.exception("Unexpected")
+        logger.exception("Download/upload failed")
         await query.edit_message_text(
             f"❌ `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN
         )
@@ -317,6 +456,12 @@ def main() -> None:
     s = cookie_summary()
     logger.info("Cookies : %s", f"ACTIVE {s['count']} entries" if s["ok"] else "DISABLED")
     logger.info("Clients : %s", " → ".join(PLAYER_CLIENTS))
+
+    # Verify ffmpeg + ffprobe are available at startup
+    for binary in ("ffmpeg", "ffprobe"):
+        r = subprocess.run([binary, "-version"], capture_output=True, timeout=5)
+        ver = r.stdout.decode().split("\n")[0] if r.stdout else "unknown"
+        logger.info("%-8s: %s", binary, ver if r.returncode == 0 else "NOT FOUND ⚠️")
 
     threading.Thread(target=run_flask, daemon=True).start()
 
