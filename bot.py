@@ -7,7 +7,7 @@ import shutil
 import threading
 from pathlib import Path
 import io
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 
 from flask import Flask, jsonify
 from telegram import Update
@@ -16,47 +16,55 @@ from telegram.constants import ParseMode, ChatAction
 from telegram.error import Conflict
 import yt_dlp
 
-# ── Logging ─────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+# ── Logging ─────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set")
 
-MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "2000"))  # Telegram supports up to 2GB
+COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "2000"))
 DOWNLOAD_DIR = "/tmp/yt_downloads"
 PORT = int(os.getenv("PORT", "8080"))
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-# Better regex
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+")
 
-# ── Check ffmpeg ───────────────────────────────────────────────
-if not shutil.which("ffmpeg"):
-    logger.warning("⚠️ ffmpeg not installed — merging may fail!")
-
-# ── yt-dlp options (FIXED CORE) ────────────────────────────────
+# ── yt-dlp options ─────────────────────────────────
 def _base_opts():
-    return {
+    opts = {
         "quiet": False,
         "no_warnings": False,
         "retries": 5,
         "socket_timeout": 30,
+
+        # Helps bypass some blocks
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        }
     }
+
+    # ✅ COOKIE FIX
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+        logger.info("Using cookies file")
+
+    return opts
+
 
 def _download_opts(tmpdir):
     opts = _base_opts()
     opts.update({
         "outtmpl": os.path.join(tmpdir, "%(title).80s.%(ext)s"),
 
-        # 🔥 FIXED FORMAT LOGIC
-        "format": "bv*+ba/best",
+        # ✅ FINAL FORMAT FIX (STABLE)
+        "format": "bv*+ba/b",
 
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -64,13 +72,15 @@ def _download_opts(tmpdir):
     })
     return opts
 
-# ── yt-dlp helpers ─────────────────────────────────────────────
+
+# ── yt-dlp helpers ────────────────────────────────
 def fetch_info(url):
     opts = _base_opts()
     opts["skip_download"] = True
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
+
 
 def download_video(url, tmpdir):
     opts = _download_opts(tmpdir)
@@ -84,25 +94,29 @@ def download_video(url, tmpdir):
 
     return max(files, key=lambda f: f.stat().st_mtime)
 
-# ── Flask health ───────────────────────────────────────────────
+
+# ── Flask health ──────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def health():
     return jsonify({"status": "ok"})
 
+
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
-# ── Handlers ──────────────────────────────────────────────────
+
+# ── Handlers ─────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send YouTube link 🎬")
+
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
     if not YOUTUBE_REGEX.search(url):
-        await update.message.reply_text("❌ Invalid URL")
+        await update.message.reply_text("❌ Invalid YouTube URL")
         return
 
     msg = await update.message.reply_text("🔍 Fetching info...")
@@ -110,7 +124,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, url)
     except Exception as e:
-        await msg.edit_text(f"❌ Error fetching info:\n{e}")
+        await msg.edit_text(f"❌ Fetch failed:\n{e}")
         return
 
     title = info.get("title", "Unknown")
@@ -149,14 +163,16 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ── Error handler ─────────────────────────────────────────────
+
+# ── Error handler ────────────────────────────────
 async def error_handler(update, ctx):
     if isinstance(ctx.error, Conflict):
-        logger.error("Bot already running somewhere else")
+        logger.error("Bot already running elsewhere")
         return
     logger.error(ctx.error)
 
-# ── Main ──────────────────────────────────────────────────────
+
+# ── Main ────────────────────────────────────────
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
@@ -167,6 +183,7 @@ def main():
     app.add_error_handler(error_handler)
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
