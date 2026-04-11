@@ -1,20 +1,15 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Render deployment — MUST be type: worker (not web).
-#
-# A Telegram polling bot must run as a single background process.
-# Using type: web causes Render to spin up multiple instances and restart
-# on health-check failures → "Conflict: terminated by other getUpdates request"
-# ─────────────────────────────────────────────────────────────────────────────
 services:
-  - type: worker          # ← background worker: one instance, no port binding
+  - type: web               # web so Render binds the port and passes health checks
     name: yt-telegram-bot
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter         # cheapest paid plan; free plan doesn't support workers
+    plan: starter
+
+    healthCheckPath: /health  # Flask responds 200 here
 
     envVars:
       - key: BOT_TOKEN
-        sync: false       # set in Render dashboard — never commit the real value
+        sync: false           # set in Render dashboard
 
       - key: COOKIES_FILE
         value: /app/cookies.txt
@@ -23,8 +18,14 @@ services:
         value: "50"
 
       - key: ALLOWED_USERS
-        value: ""         # blank = allow everyone
+        value: ""
 
       - key: DOWNLOAD_DIR
         value: /tmp/yt_downloads
 
+      # Render sets PORT automatically — Flask reads it
+      - key: PORT
+        fromService:
+          type: web
+          name: yt-telegram-bot
+          property: port
