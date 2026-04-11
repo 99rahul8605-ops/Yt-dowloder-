@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 yt-dlp==2024.7.25
 aiohttp>=3.9.0
 flask
+ffmpeg
