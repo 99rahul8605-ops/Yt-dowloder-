@@ -8,12 +8,11 @@ import threading
 from pathlib import Path
 
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -48,40 +47,8 @@ YOUTUBE_REGEX = re.compile(
     r"[\w\-]{11}"
 )
 
-# ── Quality options ───────────────────────────────────────────────────────────
-# Format strings use multiple fallbacks separated by /  so yt-dlp always finds
-# something even when a specific resolution is not available for that video.
-QUALITY_OPTIONS = [
-    (
-        "🎬 Best (≤1080p)",
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=1080]+bestaudio"
-        "/best[height<=1080]"
-        "/best",
-    ),
-    (
-        "📺 720p",
-        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=720]+bestaudio"
-        "/best[height<=720]"
-        "/best",
-    ),
-    (
-        "📱 480p",
-        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=480]+bestaudio"
-        "/best[height<=480]"
-        "/best",
-    ),
-    (
-        "🔊 Audio only (MP3)",
-        "bestaudio[ext=m4a]/bestaudio/best",
-    ),
-]
-
 # ── Player client chain ───────────────────────────────────────────────────────
 # ios and mweb bypass YouTube bot-detection without needing cookies.
-# android is deprecated and triggers "no longer supported" — excluded.
 PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookie manager ────────────────────────────────────────────────────────────
@@ -159,26 +126,19 @@ def _base_opts() -> dict:
     return opts
 
 
-def _download_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
+def _download_opts(tmpdir: str) -> dict:
+    """Options for yt-dlp: no -f, only format_sort = h264, resolution, aac."""
     opts = _base_opts()
     opts.update({
         "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
         "noprogress":          True,
-        "format":              fmt,
+        # Use sorting instead of a fixed format string
+        "format_sort":         ["vcodec:h264", "res", "acodec:aac"],
         "merge_output_format": "mp4",
-        "postprocessors":      [],
         "fragment_retries":    5,
         "continuedl":          True,
-        # Accept any format if the preferred one isn't available
-        "format_sort":         ["res", "ext:mp4:m4a", "tbr", "asr"],
+        "postprocessors":      [],   # no audio extraction
     })
-    if audio_only:
-        opts["postprocessors"].append({
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
-            "preferredquality": "192",
-        })
-        del opts["merge_output_format"]
     return opts
 
 
@@ -189,9 +149,9 @@ def fetch_info(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-def download_video(url: str, fmt: str, tmpdir: str) -> Path:
-    audio_only = fmt.startswith("bestaudio")
-    with yt_dlp.YoutubeDL(_download_opts(tmpdir, fmt, audio_only)) as ydl:
+def download_video(url: str, tmpdir: str) -> Path:
+    """Download video using format_sort (H.264 video, AAC audio)."""
+    with yt_dlp.YoutubeDL(_download_opts(tmpdir)) as ydl:
         ydl.extract_info(url, download=True)
     candidates = sorted(
         Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
@@ -226,14 +186,7 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
-# ── Keyboards / guards ────────────────────────────────────────────────────────
-def quality_keyboard(url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(lbl, callback_data=f"{fmt}|||{url}")]
-        for lbl, fmt in QUALITY_OPTIONS
-    ])
-
-
+# ── Guards ────────────────────────────────────────────────────────────────────
 def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
 
@@ -242,7 +195,7 @@ def is_allowed(update: Update) -> bool:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\n"
-        "Send me any YouTube link, pick a quality, and I'll send you the file.\n\n"
+        "Send me any YouTube link, and I'll download the best H.264 video + AAC audio.\n\n"
         "/start – this message\n/help – tips\n/cookies – auth status\n/refresh – reload cookies",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -252,8 +205,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *How to use*\n\n"
         "1. Paste a YouTube URL.\n"
-        "2. Pick quality from the buttons.\n"
-        "3. Receive your file!\n\n"
+        "2. Wait for the download and upload.\n"
+        "3. Enjoy your video!\n\n"
         f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -315,77 +268,46 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     m, s    = divmod(dur, 60)
 
     await msg.edit_text(
-        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\nChoose quality:",
+        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\n⬇️ Downloading best H.264 video…",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=quality_keyboard(text),
-    )
-
-
-async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if not is_allowed(update):
-        await query.edit_message_text("⛔ Not authorised.")
-        return
-
-    try:
-        fmt, url = query.data.split("|||", 1)
-    except ValueError:
-        await query.edit_message_text("❌ Invalid selection.")
-        return
-
-    label = next((lbl for lbl, f in QUALITY_OPTIONS if f == fmt), fmt)
-    await query.edit_message_text(
-        f"⬇️ Downloading *{label}*…", parse_mode=ParseMode.MARKDOWN
     )
 
     tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
     try:
         file_path: Path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, url, fmt, tmpdir
+            None, download_video, text, tmpdir
         )
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_SIZE_MB:
-            await query.edit_message_text(
+            await msg.edit_text(
                 f"❌ File is *{size_mb:.1f} MB* — over the {MAX_SIZE_MB} MB Telegram limit.\n"
-                "Try a lower quality.",
+                "Try a lower quality manually (e.g., add `?format=best[height<=480]` to URL).",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
-        await query.edit_message_text(
+        await msg.edit_text(
             f"📤 Uploading *{file_path.name}* ({size_mb:.1f} MB)…",
             parse_mode=ParseMode.MARKDOWN,
         )
-        await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_VIDEO)
+        await ctx.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_VIDEO)
 
         with open(file_path, "rb") as fh:
-            if file_path.suffix.lower() == ".mp3":
-                await ctx.bot.send_audio(
-                    chat_id=query.message.chat_id, audio=fh,
-                    caption=f"🎵 {file_path.stem}",
-                    read_timeout=120, write_timeout=120, connect_timeout=30,
-                )
-            else:
-                await ctx.bot.send_video(
-                    chat_id=query.message.chat_id, video=fh,
-                    caption=f"🎬 {file_path.stem}",
-                    supports_streaming=True,
-                    read_timeout=120, write_timeout=120, connect_timeout=30,
-                )
-        await query.edit_message_text("✅ Done! Enjoy 🎉")
+            await ctx.bot.send_video(
+                chat_id=msg.chat_id, video=fh,
+                caption=f"🎬 {file_path.stem}",
+                supports_streaming=True,
+                read_timeout=120, write_timeout=120, connect_timeout=30,
+            )
+        await msg.edit_text("✅ Done! Enjoy 🎉")
 
     except yt_dlp.utils.DownloadError as e:
         logger.error("Download error: %s", e)
-        await query.edit_message_text(
-            f"❌ Download failed:\n`{e}`", parse_mode=ParseMode.MARKDOWN
-        )
+        await msg.edit_text(f"❌ Download failed:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("Unexpected error")
-        await query.edit_message_text(
-            f"❌ Error: `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN
-        )
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -424,7 +346,6 @@ def main() -> None:
     app.add_handler(CommandHandler("cookies", cmd_cookies))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(CallbackQueryHandler(handle_quality_choice))
     app.add_error_handler(error_handler)
 
     logger.info("Starting Telegram polling…")
