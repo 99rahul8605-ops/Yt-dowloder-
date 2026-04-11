@@ -18,6 +18,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 import yt_dlp
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -25,6 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 COOKIES_FILE  = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
@@ -46,38 +48,28 @@ QUALITY_OPTIONS = [
     ("🔊 Audio only (MP3)", "bestaudio/best"),
 ]
 
+# ── YouTube player client chain ───────────────────────────────────────────────
+# yt-dlp tries these player clients in order until one works.
+# android / ios / tv_embedded do NOT trigger bot-detection even without cookies.
+# web_creator is tried last as a fallback that uses cookies.
+PLAYER_CLIENTS = ["android", "ios", "tv_embedded", "web_creator", "web"]
+
 # ── Cookie sanitizer ──────────────────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
 _SANITIZED_COOKIES = None
 
 
 def _sanitize_cookies(src: str) -> str:
-    """
-    Strip BOM, normalize line endings, ensure magic header is on line 1,
-    write to /tmp/_yt_bot_cookies.txt and return that path.
-    """
     raw = Path(src).read_bytes()
-
-    # Strip UTF-8 BOM
-    if raw.startswith(b"\xef\xbb\xbf"):
+    if raw.startswith(b"\xef\xbb\xbf"):     # strip UTF-8 BOM
         raw = raw[3:]
-
     text = raw.decode("utf-8", errors="replace")
-    # Normalize line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    lines = text.splitlines()
-
-    # Remove any pre-existing magic header lines (we'll re-add cleanly)
-    lines = [l for l in lines if NETSCAPE_MAGIC not in l]
-
-    # Build final content: magic header MUST be first line
-    clean = NETSCAPE_MAGIC + "\n" + "\n".join(lines) + "\n"
-
+    lines = [l for l in text.splitlines() if NETSCAPE_MAGIC not in l]
     data_lines = [l for l in lines if l.strip() and not l.startswith("#")]
     if not data_lines:
         raise ValueError("cookies.txt has no cookie data lines")
-
+    clean = NETSCAPE_MAGIC + "\n" + "\n".join(lines) + "\n"
     dst = "/tmp/_yt_bot_cookies.txt"
     Path(dst).write_text(clean, encoding="utf-8")
     logger.info("Cookies sanitized → %s  (%d entries)", dst, len(data_lines))
@@ -88,11 +80,8 @@ def get_cookies_path():
     global _SANITIZED_COOKIES
     if _SANITIZED_COOKIES:
         return _SANITIZED_COOKIES
-    if not os.path.isfile(COOKIES_FILE):
-        logger.warning("No cookies file at %s", COOKIES_FILE)
-        return None
-    if os.path.getsize(COOKIES_FILE) == 0:
-        logger.warning("cookies.txt is empty")
+    if not os.path.isfile(COOKIES_FILE) or os.path.getsize(COOKIES_FILE) == 0:
+        logger.warning("No usable cookies file at %s", COOKIES_FILE)
         return None
     try:
         _SANITIZED_COOKIES = _sanitize_cookies(COOKIES_FILE)
@@ -102,7 +91,82 @@ def get_cookies_path():
         return None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── yt-dlp option builder ─────────────────────────────────────────────────────
+def _base_opts(extra: dict = None) -> dict:
+    """
+    Core yt-dlp options shared by info-fetch and download.
+    Key: extractor_args selects mobile/TV player clients that bypass
+         YouTube's 'Sign in to confirm you're not a bot' check.
+    """
+    opts = {
+        "quiet":       True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries":     5,
+        # --- THE FIX ---
+        # Use non-web player clients; these are exempt from bot verification.
+        "extractor_args": {
+            "youtube": {
+                "player_client": PLAYER_CLIENTS,
+                # Skip age-gate check (cookies handle it if needed)
+                "skip": ["webpage", "configs"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": (
+                "com.google.android.youtube/19.09.37 "
+                "(Linux; U; Android 11) gzip"
+            ),
+        },
+    }
+    cp = get_cookies_path()
+    if cp:
+        opts["cookiefile"] = cp
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def _download_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
+    opts = _base_opts({
+        "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
+        "noprogress":          True,
+        "format":              fmt,
+        "merge_output_format": "mp4",
+        "postprocessors":      [],
+        "fragment_retries":    5,
+        "continuedl":          True,
+    })
+    if audio_only:
+        opts["postprocessors"].append({
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        })
+        del opts["merge_output_format"]
+    return opts
+
+
+def fetch_info(url: str) -> dict:
+    opts = _base_opts({"skip_download": True})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def download_video(url: str, fmt: str, tmpdir: str) -> Path:
+    audio_only = fmt.startswith("bestaudio")
+    opts = _download_opts(tmpdir, fmt, audio_only)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+    candidates = sorted(
+        Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not candidates:
+        raise FileNotFoundError("yt-dlp produced no output file")
+    return candidates[0]
+
+
+# ── Keyboards / guards ────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data=f"{fmt}|||{url}")]
@@ -114,66 +178,11 @@ def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
 
 
-def _build_ydl_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
-    opts = {
-        "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
-        "quiet":               True,
-        "no_warnings":         True,
-        "noprogress":          True,
-        "format":              fmt,
-        "merge_output_format": "mp4",
-        "postprocessors":      [],
-        "socket_timeout":      30,
-        "retries":             5,
-        "fragment_retries":    5,
-        "continuedl":          True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
-    }
-    if audio_only:
-        opts["postprocessors"].append({
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        })
-        opts.pop("merge_output_format", None)
-
-    cp = get_cookies_path()
-    if cp:
-        opts["cookiefile"] = cp
-    return opts
-
-
-def fetch_info(url: str) -> dict:
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    cp = get_cookies_path()
-    if cp:
-        opts["cookiefile"] = cp
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def download_video(url: str, fmt: str, tmpdir: str) -> Path:
-    audio_only = fmt.startswith("bestaudio")
-    with yt_dlp.YoutubeDL(_build_ydl_opts(tmpdir, fmt, audio_only)) as ydl:
-        ydl.extract_info(url, download=True)
-    candidates = sorted(Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError("yt-dlp produced no output file")
-    return candidates[0]
-
-
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\n"
-        "Send me any YouTube link and I'll let you pick a quality, "
-        "then download and send the file.\n\n"
+        "Send me any YouTube link, pick a quality, and I'll send you the file.\n\n"
         "/start – this message\n/help – tips\n/cookies – auth status",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -182,7 +191,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *How to use*\n\n"
-        "1. Paste a YouTube URL.\n2. Pick a quality.\n3. Wait for your file!\n\n"
+        "1. Paste a YouTube URL.\n"
+        "2. Pick a quality from the buttons.\n"
+        "3. Receive your file!\n\n"
         f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -193,16 +204,17 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     cp = get_cookies_path()
     if cp:
-        data_lines = [
-            l for l in Path(cp).read_text().splitlines()
+        n = sum(
+            1 for l in Path(cp).read_text().splitlines()
             if l.strip() and not l.startswith("#")
-        ]
-        status = f"✅ Active — {len(data_lines)} cookies loaded"
+        )
+        status = f"✅ Active — {n} cookies loaded"
     else:
-        src_ok = os.path.isfile(COOKIES_FILE)
-        status = f"❌ Not loaded  (file exists: {src_ok})"
+        status = f"❌ Not loaded  (checked: {COOKIES_FILE})"
     await update.message.reply_text(
-        f"🍪 *Cookie Status*\nPath: `{COOKIES_FILE}`\n{status}",
+        f"🍪 *Cookie Status*\n{status}\n\n"
+        "Note: bot-detection bypass via Android/TV player clients is always active "
+        "regardless of cookie status.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -264,7 +276,7 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         size_mb = file_path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_SIZE_MB:
             await query.edit_message_text(
-                f"❌ File is *{size_mb:.1f} MB* — over the {MAX_SIZE_MB} MB limit.\n"
+                f"❌ File is *{size_mb:.1f} MB* — over the {MAX_SIZE_MB} MB Telegram limit.\n"
                 "Try a lower quality.",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -295,7 +307,9 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
     except yt_dlp.utils.DownloadError as e:
         logger.error("Download error: %s", e)
-        await query.edit_message_text(f"❌ Download failed:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(
+            f"❌ Download failed:\n`{e}`", parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
         logger.exception("Unexpected error")
         await query.edit_message_text(
@@ -305,10 +319,11 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     cp = get_cookies_path()
-    logger.info("Cookie auth: %s", f"ACTIVE ({cp})" if cp else "DISABLED")
+    logger.info("Cookie auth  : %s", f"ACTIVE ({cp})" if cp else "DISABLED")
+    logger.info("Player chain : %s", " → ".join(PLAYER_CLIENTS))
 
     app = (
         Application.builder()
