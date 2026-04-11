@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Render deployment — MUST be type: worker (not web).
+#
+# A Telegram polling bot must run as a single background process.
+# Using type: web causes Render to spin up multiple instances and restart
+# on health-check failures → "Conflict: terminated by other getUpdates request"
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  - type: worker          # ← background worker: one instance, no port binding
+    name: yt-telegram-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter         # cheapest paid plan; free plan doesn't support workers
+
+    envVars:
+      - key: BOT_TOKEN
+        sync: false       # set in Render dashboard — never commit the real value
+
+      - key: COOKIES_FILE
+        value: /app/cookies.txt
+
+      - key: MAX_SIZE_MB
+        value: "50"
+
+      - key: ALLOWED_USERS
+        value: ""         # blank = allow everyone
+
+      - key: DOWNLOAD_DIR
+        value: /tmp/yt_downloads
+
