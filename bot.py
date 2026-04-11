@@ -48,7 +48,9 @@ QUALITY_OPTIONS = [
     ("🔊 Audio only MP3", None, True),
 ]
 
-PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
+# ios returns "Untested" format 270 (HLS) which may not download.
+# Use web-based clients only — they return tested, standard streams.
+PLAYER_CLIENTS = ["mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookies ───────────────────────────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
@@ -86,7 +88,8 @@ def load_cookies(force=False) -> str | None:
 def cookie_summary() -> dict:
     cp = load_cookies()
     if cp:
-        n = sum(1 for l in Path(cp).read_text().splitlines() if l.strip() and not l.startswith("#"))
+        n = sum(1 for l in Path(cp).read_text().splitlines()
+                if l.strip() and not l.startswith("#"))
         return {"ok": True, "count": n}
     return {"ok": False, "src": COOKIES_FILE,
             "exists": os.path.isfile(COOKIES_FILE),
@@ -107,6 +110,17 @@ def _base_opts() -> dict:
     return opts
 
 def _download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dict:
+    """
+    Use remux_video instead of format filters.
+    Equivalent of: yt-dlp -t mp4 -S vcodec:h264,res:N,acodec:aac
+
+    -t mp4 (remux_video) means: take whatever format is available and
+    remux it into mp4 using ffmpeg — no format availability check needed.
+
+    No "format" key = yt-dlp picks the best available stream freely,
+    then ffmpeg remuxes the container to mp4. This never fails with
+    "format not available" because we place no restrictions on the source.
+    """
     opts = _base_opts()
     opts.update({
         "outtmpl":          os.path.join(tmpdir, "%(title).80s.%(ext)s"),
@@ -117,19 +131,22 @@ def _download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dic
     })
 
     if audio_only:
-        # No -f, sort by audio codec preference only
+        # Sort by audio quality, ffmpeg converts to mp3
         opts["format_sort"] = ["acodec:aac", "abr"]
         opts["postprocessors"].append({
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
             "preferredquality": "192",
         })
     else:
-        # Equivalent of: yt-dlp -S vcodec:h264,res:N,acodec:aac
-        # NO "format" key — let format_sort pick freely
-        sort_keys = ["vcodec:h264", f"res:{max_height}" if max_height else "res", "acodec:aac"]
-        opts["format_sort"]        = sort_keys
-        opts["merge_output_format"] = "mp4"
+        # Prefer h264 + resolution cap + aac audio — but NEVER hard-require them.
+        # remux_video="mp4" is the Python equivalent of CLI -t mp4:
+        # ffmpeg remuxes whatever container yt-dlp downloads into mp4.
+        sort = ["vcodec:h264", "acodec:aac"]
+        if max_height:
+            sort.insert(1, f"res:{max_height}")
+        opts["format_sort"] = sort
+        opts["remux_video"] = "mp4"   # -t mp4: remux to mp4, never fails
 
     return opts
 
@@ -260,7 +277,8 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             return
 
         await query.edit_message_text(
-            f"📤 Uploading *{fp.name}* ({size_mb:.1f} MB)…", parse_mode=ParseMode.MARKDOWN
+            f"📤 Uploading *{fp.name}* ({size_mb:.1f} MB)…",
+            parse_mode=ParseMode.MARKDOWN,
         )
         await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_VIDEO)
 
@@ -284,7 +302,9 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(f"❌ `{e}`", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("Unexpected")
-        await query.edit_message_text(f"❌ `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(
+            f"❌ `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -316,7 +336,11 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("Polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
     main()
