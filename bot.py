@@ -7,7 +7,7 @@ import shutil
 import threading
 from pathlib import Path
 import io
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 
 from flask import Flask, jsonify
 from telegram import Update
@@ -46,6 +46,11 @@ YOUTUBE_REGEX = re.compile(
     r"(youtube\.com/(watch\?v=|shorts/|embed/)|youtu\.be/)"
     r"[\w\-]{11}"
 )
+
+# Optional: if you use the static yt-dlp binary instead of the Python package,
+# set YTDLP_BINARY = "/usr/local/bin/yt-dlp" and adapt the download functions.
+# This code uses the Python package (recommended for simplicity).
+# For multi‑arch with bundled ffmpeg, consider the static binary approach.
 
 # ── Cookie manager ────────────────────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
@@ -99,9 +104,9 @@ def cookie_summary() -> dict:
         "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
     }
 
-# ── yt-dlp options – fixed: no forced client, robust format ──────────────────
+# ── yt-dlp options – FIXED ────────────────────────────────────────────────────
 def _base_opts() -> dict:
-    """Base options: ignore config, verbose, no forced player client."""
+    """Base options: ignore config, verbose, no forced player_client."""
     opts: dict = {
         "ignoreconfig":   True,       # critical: prevent external -f
         "verbose":        True,
@@ -121,7 +126,6 @@ def _download_opts(tmpdir: str) -> dict:
     opts.update({
         "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
         "noprogress":          False,
-        # The robust format selector that always works
         "format":              "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "fragment_retries":    5,
@@ -262,7 +266,6 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     s = cookie_summary()
-    # Try to get yt-dlp version
     import yt_dlp.version
     version = getattr(yt_dlp.version, '__version__', 'unknown')
     if s["ok"]:
