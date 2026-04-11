@@ -9,31 +9,18 @@ services:
     restart: unless-stopped
 
     environment:
-      # ── Required ────────────────────────────────────────────────────────────
       - BOT_TOKEN=${BOT_TOKEN}
-
-      # ── Optional ────────────────────────────────────────────────────────────
-      # Path inside the container where cookies.txt is mounted
       - COOKIES_FILE=/app/cookies.txt
-
-      # Maximum file size (MB) that can be sent via Telegram Bot API (hard limit = 50)
       - MAX_SIZE_MB=${MAX_SIZE_MB:-50}
-
-      # Comma-separated Telegram user IDs allowed to use the bot.
-      # Leave empty (or omit) to allow everyone.
       - ALLOWED_USERS=${ALLOWED_USERS:-}
-
-      # Temporary download directory (inside the container)
       - DOWNLOAD_DIR=/tmp/yt_downloads
 
     volumes:
-      # Mount your Netscape-format cookies file (export via browser extension)
+      # Mount fresh cookies at runtime — overrides the baked-in copy.
+      # Make sure this file has actual cookie data (not just comments).
+      # Run: bash get_cookies.sh chrome   to regenerate it.
       - ./cookies.txt:/app/cookies.txt:ro
 
-      # Optional: persist downloads between restarts (useful for debugging)
-      # - ./downloads:/tmp/yt_downloads
-
-    # Resource limits — tune as needed
     deploy:
       resources:
         limits:
@@ -46,3 +33,4 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+        
