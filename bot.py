@@ -111,15 +111,13 @@ def _base_opts() -> dict:
 
 def _download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dict:
     """
-    Use remux_video instead of format filters.
-    Equivalent of: yt-dlp -t mp4 -S vcodec:h264,res:N,acodec:aac
+    format="b" selects a single best combined stream (never fails).
+    format_sort influences which "best" is chosen (h264 > other codecs).
+    remux_video="mp4" remuxes the result to mp4 via ffmpeg.
 
-    -t mp4 (remux_video) means: take whatever format is available and
-    remux it into mp4 using ffmpeg — no format availability check needed.
-
-    No "format" key = yt-dlp picks the best available stream freely,
-    then ffmpeg remuxes the container to mp4. This never fails with
-    "format not available" because we place no restrictions on the source.
+    Why "b" and not bestvideo+bestaudio:
+      - bestvideo+bestaudio requires DASH separate streams → fails on HLS-only videos
+      - "b" = best single stream, always available regardless of protocol
     """
     opts = _base_opts()
     opts.update({
@@ -131,7 +129,7 @@ def _download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dic
     })
 
     if audio_only:
-        # Sort by audio quality, ffmpeg converts to mp3
+        opts["format"]      = "ba/b"          # best audio stream, fallback to best
         opts["format_sort"] = ["acodec:aac", "abr"]
         opts["postprocessors"].append({
             "key":              "FFmpegExtractAudio",
@@ -139,14 +137,14 @@ def _download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dic
             "preferredquality": "192",
         })
     else:
-        # Prefer h264 + resolution cap + aac audio — but NEVER hard-require them.
-        # remux_video="mp4" is the Python equivalent of CLI -t mp4:
-        # ffmpeg remuxes whatever container yt-dlp downloads into mp4.
+        # "b" = single best stream, never triggers "format not available"
+        # format_sort ranks available streams by preference before "b" picks the top one
+        opts["format"]      = "b"
+        opts["remux_video"] = "mp4"
         sort = ["vcodec:h264", "acodec:aac"]
         if max_height:
-            sort.insert(1, f"res:{max_height}")
+            sort.insert(0, f"res:{max_height}")
         opts["format_sort"] = sort
-        opts["remux_video"] = "mp4"   # -t mp4: remux to mp4, never fails
 
     return opts
 
