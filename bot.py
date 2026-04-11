@@ -6,183 +6,433 @@ import tempfile
 import shutil
 import threading
 from pathlib import Path
-import io
-from contextlib import redirect_stderr
 
 from flask import Flask, jsonify
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import Conflict
 import yt_dlp
 
-# ── Logging ─────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set")
+# Silence Flask/Werkzeug request logs to keep output clean
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
-MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "2000"))
-DOWNLOAD_DIR = "/tmp/yt_downloads"
-PORT = int(os.getenv("PORT", "8080"))
+# ── Config ────────────────────────────────────────────────────────────────────
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+COOKIES_FILE  = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
+DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "/tmp/yt_downloads")
+ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
+PORT          = int(os.getenv("PORT", "8080"))   # Render injects $PORT
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+")
+YOUTUBE_REGEX = re.compile(
+    r"(https?://)?(www\.)?"
+    r"(youtube\.com/(watch\?v=|shorts/|embed/)|youtu\.be/)"
+    r"[\w\-]{11}"
+)
 
-# ── yt-dlp options ─────────────────────────────────
-def _base_opts():
-    opts = {
-        "quiet": False,
-        "no_warnings": False,
-        "retries": 5,
-        "socket_timeout": 30,
+# ── Quality options ───────────────────────────────────────────────────────────
+# Format strings use multiple fallbacks separated by /  so yt-dlp always finds
+# something even when a specific resolution is not available for that video.
+QUALITY_OPTIONS = [
+    (
+        "🎬 Best (≤1080p)",
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=1080]+bestaudio"
+        "/best[height<=1080]"
+        "/best",
+    ),
+    (
+        "📺 720p",
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=720]+bestaudio"
+        "/best[height<=720]"
+        "/best",
+    ),
+    (
+        "📱 480p",
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=480]+bestaudio"
+        "/best[height<=480]"
+        "/best",
+    ),
+    (
+        "🔊 Audio only (MP3)",
+        "bestaudio[ext=m4a]/bestaudio/best",
+    ),
+]
 
-        # Helps bypass some blocks
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"]
-            }
-        }
+# ── Player client chain ───────────────────────────────────────────────────────
+# ios and mweb bypass YouTube bot-detection without needing cookies.
+# android is deprecated and triggers "no longer supported" — excluded.
+PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
+
+# ── Cookie manager ────────────────────────────────────────────────────────────
+NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
+_sanitized_path: str | None = None
+
+
+def _sanitize_and_validate(src: str) -> str:
+    raw = Path(src).read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    text = raw.decode("utf-8", errors="replace")
+    crlf = text.count("\r")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if crlf:
+        logger.info("Converted %d CRLF → LF in cookies", crlf)
+    lines = [l for l in text.splitlines() if "HTTP Cookie File" not in l]
+    data_lines = [l for l in lines if l.strip() and not l.startswith("#")
+                  and len(l.split("\t")) == 7]
+    if not data_lines:
+        raise ValueError("No valid 7-field cookie lines found")
+    clean = NETSCAPE_MAGIC + "\n" + "\n".join(lines) + "\n"
+    dst = "/tmp/_yt_bot_cookies.txt"
+    Path(dst).write_text(clean, encoding="utf-8")
+    logger.info("Cookies sanitized → %s (%d entries)", dst, len(data_lines))
+    return dst
+
+
+def load_cookies(force: bool = False) -> str | None:
+    global _sanitized_path
+    if _sanitized_path and not force:
+        return _sanitized_path
+    if not os.path.isfile(COOKIES_FILE) or os.path.getsize(COOKIES_FILE) == 0:
+        logger.warning("No usable cookies file at %s", COOKIES_FILE)
+        return None
+    try:
+        _sanitized_path = _sanitize_and_validate(COOKIES_FILE)
+        return _sanitized_path
+    except Exception as e:
+        logger.error("Cookie load failed: %s", e)
+        _sanitized_path = None
+        return None
+
+
+def cookie_summary() -> dict:
+    cp = load_cookies()
+    if cp:
+        lines = Path(cp).read_text().splitlines()
+        n = sum(1 for l in lines if l.strip() and not l.startswith("#"))
+        return {"ok": True, "count": n}
+    return {
+        "ok": False,
+        "src": COOKIES_FILE,
+        "exists": os.path.isfile(COOKIES_FILE),
+        "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
     }
 
-    # ✅ COOKIE FIX
-    if os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-        logger.info("Using cookies file")
 
+# ── yt-dlp ────────────────────────────────────────────────────────────────────
+def _base_opts() -> dict:
+    opts: dict = {
+        "quiet":          True,
+        "no_warnings":    True,
+        "socket_timeout": 30,
+        "retries":        5,
+        "extractor_args": {
+            "youtube": {
+                "player_client": PLAYER_CLIENTS,
+            }
+        },
+    }
+    cp = load_cookies()
+    if cp:
+        opts["cookiefile"] = cp
     return opts
 
 
-def _download_opts(tmpdir):
+def _download_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
     opts = _base_opts()
     opts.update({
-        "outtmpl": os.path.join(tmpdir, "%(title).80s.%(ext)s"),
-
-        # ✅ FINAL FORMAT FIX (STABLE)
-        "format": "bv*+ba/b",
-
+        "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
+        "noprogress":          True,
+        "format":              fmt,
         "merge_output_format": "mp4",
-        "noplaylist": True,
-        "continuedl": True,
+        "postprocessors":      [],
+        "fragment_retries":    5,
+        "continuedl":          True,
+        # Accept any format if the preferred one isn't available
+        "format_sort":         ["res", "ext:mp4:m4a", "tbr", "asr"],
     })
+    if audio_only:
+        opts["postprocessors"].append({
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": "192",
+        })
+        del opts["merge_output_format"]
     return opts
 
 
-# ── yt-dlp helpers ────────────────────────────────
-def fetch_info(url):
+def fetch_info(url: str) -> dict:
     opts = _base_opts()
     opts["skip_download"] = True
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
-def download_video(url, tmpdir):
-    opts = _download_opts(tmpdir)
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
+def download_video(url: str, fmt: str, tmpdir: str) -> Path:
+    audio_only = fmt.startswith("bestaudio")
+    with yt_dlp.YoutubeDL(_download_opts(tmpdir, fmt, audio_only)) as ydl:
         ydl.extract_info(url, download=True)
+    candidates = sorted(
+        Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not candidates:
+        raise FileNotFoundError("yt-dlp produced no output file")
+    return candidates[0]
 
-    files = list(Path(tmpdir).glob("*"))
-    if not files:
-        raise Exception("No file downloaded")
 
-    return max(files, key=lambda f: f.stat().st_mtime)
-
-
-# ── Flask health ──────────────────────────────────
+# ── Flask health-check server ─────────────────────────────────────────────────
 flask_app = Flask(__name__)
+
 
 @flask_app.route("/")
 def health():
-    return jsonify({"status": "ok"})
+    s = cookie_summary()
+    return jsonify({
+        "status":  "ok",
+        "bot":     "running",
+        "cookies": s,
+        "clients": PLAYER_CLIENTS,
+    })
+
+
+@flask_app.route("/health")
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
+    logger.info("Flask health server listening on port %d", PORT)
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
-# ── Handlers ─────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send YouTube link 🎬")
+# ── Keyboards / guards ────────────────────────────────────────────────────────
+def quality_keyboard(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(lbl, callback_data=f"{fmt}|||{url}")]
+        for lbl, fmt in QUALITY_OPTIONS
+    ])
 
 
-async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
+def is_allowed(update: Update) -> bool:
+    return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
 
-    if not YOUTUBE_REGEX.search(url):
-        await update.message.reply_text("❌ Invalid YouTube URL")
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "👋 *YouTube Downloader Bot*\n\n"
+        "Send me any YouTube link, pick a quality, and I'll send you the file.\n\n"
+        "/start – this message\n/help – tips\n/cookies – auth status\n/refresh – reload cookies",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📖 *How to use*\n\n"
+        "1. Paste a YouTube URL.\n"
+        "2. Pick quality from the buttons.\n"
+        "3. Receive your file!\n\n"
+        f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    s = cookie_summary()
+    if s["ok"]:
+        body = f"✅ *Active* — {s['count']} cookies loaded"
+    else:
+        body = (
+            f"❌ *Not loaded*\n"
+            f"File: `{s['src']}`  exists={s['exists']}  size={s['size']} bytes\n"
+            "Run `bash get_cookies.sh chrome` then send /refresh"
+        )
+    await update.message.reply_text(
+        f"🍪 *Cookie Status*\n{body}\n\n"
+        f"_Clients: {' → '.join(PLAYER_CLIENTS[:3])} …_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    msg = await update.message.reply_text("🔄 Reloading cookies…")
+    result = load_cookies(force=True)
+    s = cookie_summary()
+    if result:
+        await msg.edit_text(f"✅ Reloaded — {s['count']} cookies active")
+    else:
+        await msg.edit_text(
+            "❌ Reload failed. Check that `cookies.txt` has valid data.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Not authorised.")
+        return
+    text = update.message.text.strip()
+    if not YOUTUBE_REGEX.search(text):
+        await update.message.reply_text("❌ Please send a valid YouTube URL.")
         return
 
-    msg = await update.message.reply_text("🔍 Fetching info...")
+    msg = await update.message.reply_text("🔍 Fetching video info…")
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, text)
+    except yt_dlp.utils.DownloadError as e:
+        await msg.edit_text(f"❌ Could not fetch info:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    title   = info.get("title", "Unknown")
+    channel = info.get("uploader", "Unknown")
+    dur     = int(info.get("duration") or 0)
+    m, s    = divmod(dur, 60)
+
+    await msg.edit_text(
+        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\nChoose quality:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=quality_keyboard(text),
+    )
+
+
+async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        await query.edit_message_text("⛔ Not authorised.")
+        return
 
     try:
-        info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, url)
-    except Exception as e:
-        await msg.edit_text(f"❌ Fetch failed:\n{e}")
+        fmt, url = query.data.split("|||", 1)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection.")
         return
 
-    title = info.get("title", "Unknown")
-
-    await msg.edit_text(f"⬇️ Downloading:\n{title}")
+    label = next((lbl for lbl, f in QUALITY_OPTIONS if f == fmt), fmt)
+    await query.edit_message_text(
+        f"⬇️ Downloading *{label}*…", parse_mode=ParseMode.MARKDOWN
+    )
 
     tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
-
     try:
-        file_path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, url, tmpdir
+        file_path: Path = await asyncio.get_event_loop().run_in_executor(
+            None, download_video, url, fmt, tmpdir
         )
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
-
         if size_mb > MAX_SIZE_MB:
-            await msg.edit_text(f"❌ File too large: {size_mb:.1f} MB")
+            await query.edit_message_text(
+                f"❌ File is *{size_mb:.1f} MB* — over the {MAX_SIZE_MB} MB Telegram limit.\n"
+                "Try a lower quality.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
 
-        await msg.edit_text("📤 Uploading...")
-        await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+        await query.edit_message_text(
+            f"📤 Uploading *{file_path.name}* ({size_mb:.1f} MB)…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_VIDEO)
 
-        with open(file_path, "rb") as f:
-            await ctx.bot.send_video(
-                chat_id=update.effective_chat.id,
-                video=f,
-                caption=title,
-                supports_streaming=True,
-            )
+        with open(file_path, "rb") as fh:
+            if file_path.suffix.lower() == ".mp3":
+                await ctx.bot.send_audio(
+                    chat_id=query.message.chat_id, audio=fh,
+                    caption=f"🎵 {file_path.stem}",
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
+            else:
+                await ctx.bot.send_video(
+                    chat_id=query.message.chat_id, video=fh,
+                    caption=f"🎬 {file_path.stem}",
+                    supports_streaming=True,
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
+        await query.edit_message_text("✅ Done! Enjoy 🎉")
 
-        await msg.edit_text("✅ Done")
-
+    except yt_dlp.utils.DownloadError as e:
+        logger.error("Download error: %s", e)
+        await query.edit_message_text(
+            f"❌ Download failed:\n`{e}`", parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
-        await msg.edit_text(f"❌ Download failed:\n{e}")
-
+        logger.exception("Unexpected error")
+        await query.edit_message_text(
+            f"❌ Error: `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Error handler ────────────────────────────────
-async def error_handler(update, ctx):
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, Conflict):
-        logger.error("Bot already running elsewhere")
+        logger.critical("Conflict — another bot instance is running. Stop it first.")
         return
-    logger.error(ctx.error)
+    logger.error("Unhandled exception: %s", ctx.error, exc_info=ctx.error)
 
 
-# ── Main ────────────────────────────────────────
-def main():
-    threading.Thread(target=run_flask, daemon=True).start()
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main() -> None:
+    s = cookie_summary()
+    if s["ok"]:
+        logger.info("Cookie auth  : ACTIVE — %d entries", s["count"])
+    else:
+        logger.warning("Cookie auth  : DISABLED")
+    logger.info("Player chain : %s", " → ".join(PLAYER_CLIENTS))
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Start Flask health-check server in a daemon thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
 
-    app.add_handler(CommandHandler("start", start))
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("cookies", cmd_cookies))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(handle_quality_choice))
     app.add_error_handler(error_handler)
 
-    app.run_polling()
+    logger.info("Starting Telegram polling…")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":
