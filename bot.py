@@ -4,8 +4,10 @@ import asyncio
 import logging
 import tempfile
 import shutil
+import threading
 from pathlib import Path
 
+from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,12 +29,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence Flask/Werkzeug request logs to keep output clean
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 COOKIES_FILE  = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
 DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "/tmp/yt_downloads")
 ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
+PORT          = int(os.getenv("PORT", "8080"))   # Render injects $PORT
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -42,26 +48,40 @@ YOUTUBE_REGEX = re.compile(
     r"[\w\-]{11}"
 )
 
+# ── Quality options ───────────────────────────────────────────────────────────
+# Format strings use multiple fallbacks separated by /  so yt-dlp always finds
+# something even when a specific resolution is not available for that video.
 QUALITY_OPTIONS = [
-    ("🎬 Best (≤1080p)", "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
-    ("📺 720p",           "bestvideo[height<=720]+bestaudio/best[height<=720]"),
-    ("📱 480p",           "bestvideo[height<=480]+bestaudio/best[height<=480]"),
-    ("🔊 Audio only (MP3)", "bestaudio/best"),
+    (
+        "🎬 Best (≤1080p)",
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=1080]+bestaudio"
+        "/best[height<=1080]"
+        "/best",
+    ),
+    (
+        "📺 720p",
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=720]+bestaudio"
+        "/best[height<=720]"
+        "/best",
+    ),
+    (
+        "📱 480p",
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=480]+bestaudio"
+        "/best[height<=480]"
+        "/best",
+    ),
+    (
+        "🔊 Audio only (MP3)",
+        "bestaudio[ext=m4a]/bestaudio/best",
+    ),
 ]
 
-# ── Player clients ────────────────────────────────────────────────────────────
-# yt-dlp tries these in order until one returns a valid stream.
-#
-# Why these specific clients:
-#   ios              — Apple iOS app API; not subject to bot-verification
-#   mweb             — YouTube mobile web; minimal bot-checking
-#   android_testsuite— internal test client; bypasses "not supported" error
-#   android_vr       — VR client; also exempt from standard bot checks
-#   web_creator      — YouTube Studio; less restricted than plain web
-#   web              — standard fallback; uses cookies if available
-#
-# The "no longer supported" error happens when the android client (deprecated)
-# or web client without valid cookies is tried first.  ios + mweb avoid this.
+# ── Player client chain ───────────────────────────────────────────────────────
+# ios and mweb bypass YouTube bot-detection without needing cookies.
+# android is deprecated and triggers "no longer supported" — excluded.
 PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookie manager ────────────────────────────────────────────────────────────
@@ -112,9 +132,12 @@ def cookie_summary() -> dict:
         lines = Path(cp).read_text().splitlines()
         n = sum(1 for l in lines if l.strip() and not l.startswith("#"))
         return {"ok": True, "count": n}
-    return {"ok": False, "src": COOKIES_FILE,
-            "exists": os.path.isfile(COOKIES_FILE),
-            "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0}
+    return {
+        "ok": False,
+        "src": COOKIES_FILE,
+        "exists": os.path.isfile(COOKIES_FILE),
+        "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
+    }
 
 
 # ── yt-dlp ────────────────────────────────────────────────────────────────────
@@ -146,11 +169,13 @@ def _download_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
         "postprocessors":      [],
         "fragment_retries":    5,
         "continuedl":          True,
+        # Accept any format if the preferred one isn't available
+        "format_sort":         ["res", "ext:mp4:m4a", "tbr", "asr"],
     })
     if audio_only:
         opts["postprocessors"].append({
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
             "preferredquality": "192",
         })
         del opts["merge_output_format"]
@@ -176,6 +201,31 @@ def download_video(url: str, fmt: str, tmpdir: str) -> Path:
     return candidates[0]
 
 
+# ── Flask health-check server ─────────────────────────────────────────────────
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def health():
+    s = cookie_summary()
+    return jsonify({
+        "status":  "ok",
+        "bot":     "running",
+        "cookies": s,
+        "clients": PLAYER_CLIENTS,
+    })
+
+
+@flask_app.route("/health")
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
+
+def run_flask():
+    logger.info("Flask health server listening on port %d", PORT)
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
 # ── Keyboards / guards ────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -188,7 +238,7 @@ def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
 
 
-# ── Command handlers ──────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\n"
@@ -243,12 +293,10 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-# ── URL handler ───────────────────────────────────────────────────────────────
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text("⛔ Not authorised.")
         return
-
     text = update.message.text.strip()
     if not YOUTUBE_REGEX.search(text):
         await update.message.reply_text("❌ Please send a valid YouTube URL.")
@@ -273,11 +321,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ── Quality callback ──────────────────────────────────────────────────────────
 async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     if not is_allowed(update):
         await query.edit_message_text("⛔ Not authorised.")
         return
@@ -328,7 +374,6 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
                     supports_streaming=True,
                     read_timeout=120, write_timeout=120, connect_timeout=30,
                 )
-
         await query.edit_message_text("✅ Done! Enjoy 🎉")
 
     except yt_dlp.utils.DownloadError as e:
@@ -345,14 +390,9 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Error handler ─────────────────────────────────────────────────────────────
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, Conflict):
-        logger.critical(
-            "Conflict error — another bot instance is running. "
-            "Shut down all other instances before starting this one."
-        )
-        # Don't crash the process; log and let the loop recover
+        logger.critical("Conflict — another bot instance is running. Stop it first.")
         return
     logger.error("Unhandled exception: %s", ctx.error, exc_info=ctx.error)
 
@@ -365,6 +405,10 @@ def main() -> None:
     else:
         logger.warning("Cookie auth  : DISABLED")
     logger.info("Player chain : %s", " → ".join(PLAYER_CLIENTS))
+
+    # Start Flask health-check server in a daemon thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
 
     app = (
         Application.builder()
@@ -383,10 +427,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_quality_choice))
     app.add_error_handler(error_handler)
 
-    logger.info("Starting polling (drop_pending_updates=True)…")
+    logger.info("Starting Telegram polling…")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # discard stale messages from previous runs
+        drop_pending_updates=True,
         close_loop=False,
     )
 
