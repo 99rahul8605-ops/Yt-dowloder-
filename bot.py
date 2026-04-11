@@ -107,11 +107,13 @@ def cookie_summary() -> dict:
     }
 
 
-# ── yt-dlp ────────────────────────────────────────────────────────────────────
+# ── yt-dlp (verbose enabled) ─────────────────────────────────────────────────
 def _base_opts() -> dict:
+    """Base options with verbose logging (equivalent to -v)."""
     opts: dict = {
-        "quiet":          True,
-        "no_warnings":    True,
+        "verbose":        True,      # ← -v equivalent
+        "quiet":          False,     # ← show all messages
+        "no_warnings":    False,     # ← show warnings
         "socket_timeout": 30,
         "retries":        5,
         "extractor_args": {
@@ -131,7 +133,7 @@ def _download_opts(tmpdir: str) -> dict:
     opts = _base_opts()
     opts.update({
         "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
-        "noprogress":          True,
+        "noprogress":          False,    # show progress in logs
         # Use sorting instead of a fixed format string
         "format_sort":         ["vcodec:h264", "res", "acodec:aac"],
         "merge_output_format": "mp4",
