@@ -47,7 +47,7 @@ YOUTUBE_REGEX = re.compile(
     r"[\w\-]{11}"
 )
 
-# ── Cookie manager ────────────────────────────────────────────────────────────
+# ── Cookie manager (unchanged) ───────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
 _sanitized_path: str | None = None
 
@@ -99,23 +99,16 @@ def cookie_summary() -> dict:
         "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
     }
 
-# ── yt-dlp options (working clients, no forced format) ───────────────────────
+# ── yt-dlp options – using robust format selector ────────────────────────────
 def _base_opts() -> dict:
-    """Base options: ignore config, verbose, and use working YouTube clients."""
     opts: dict = {
-        "ignoreconfig":   True,
+        "ignoreconfig":   True,      # critical: no external -f
         "verbose":        True,
         "quiet":          False,
         "no_warnings":    False,
         "socket_timeout": 30,
         "retries":        5,
-        # Do NOT force player_client – let yt-dlp use its default (android, web)
-        # If you want to be explicit, use ["web", "mweb"] (both work well)
-        # "extractor_args": {
-        #     "youtube": {
-        #         "player_client": ["web", "mweb"],
-        #     }
-        # },
+        # Let yt-dlp choose its default clients (no forced player_client)
     }
     cp = load_cookies()
     if cp:
@@ -123,13 +116,12 @@ def _base_opts() -> dict:
     return opts
 
 def _download_opts(tmpdir: str) -> dict:
-    """Download options: flexible format sorting, fallback if H.264 missing."""
     opts = _base_opts()
     opts.update({
         "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
         "noprogress":          False,
-        # Prefer H.264 + AAC, but allow other codecs if necessary
-        "format_sort":         ["res", "vcodec:h264", "acodec:aac", "vcodec", "acodec"],
+        # Use the generic "bestvideo+bestaudio/best" – works for any video
+        "format":              "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "fragment_retries":    5,
         "continuedl":          True,
@@ -159,7 +151,7 @@ def download_video_with_logs(url: str, tmpdir: str) -> tuple[Path, str]:
         raise FileNotFoundError("yt-dlp produced no output file")
     return candidates[0], log_capture.getvalue()
 
-# ── Flask health server ───────────────────────────────────────────────────────
+# ── Flask health server (unchanged) ──────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -179,15 +171,14 @@ def run_flask():
     logger.info("Flask health server listening on port %d", PORT)
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# ── Guards ────────────────────────────────────────────────────────────────────
+# ── Guards & Handlers (mostly unchanged, but improved error msg) ─────────────
 def is_allowed(update: Update) -> bool:
     return not ALLOWED_USERS or str(update.effective_user.id) in ALLOWED_USERS
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\n"
-        "Send me any YouTube link, and I'll download the best available video (preferring H.264).\n\n"
+        "Send me any YouTube link, and I'll download the best available video (auto‑merged).\n\n"
         "/start – this message\n/help – tips\n/cookies – auth status\n/refresh – reload cookies",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -199,7 +190,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "2. Wait for the download and upload.\n"
         "3. Enjoy your video!\n\n"
         f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.\n\n"
-        "If you get errors, try refreshing cookies (/refresh) or use a fresh cookies.txt.",
+        "If you get errors, try `/refresh` (cookies) or update yt‑dlp.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -217,7 +208,7 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await update.message.reply_text(
         f"🍪 *Cookie Status*\n{body}\n\n"
-        "_Tip: Expired cookies cause 'Precondition check failed' errors._",
+        "_Expired cookies cause 'Precondition check failed' errors._",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -249,19 +240,17 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         info, ytdlp_logs = await asyncio.get_event_loop().run_in_executor(
             None, fetch_info_with_logs, text
         )
-        # Log the first 2000 chars of verbose output for debugging
         logger.info("yt-dlp fetch logs (first 2000 chars):\n%s", ytdlp_logs[:2000])
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Fetch info failed: {error_msg}")
-        # Try to show a helpful message
         await msg.edit_text(
             f"❌ Could not fetch video info.\n"
             f"Error: `{error_msg}`\n\n"
             "Possible causes:\n"
             "• Expired cookies – try `/refresh`\n"
             "• Video is private/age‑restricted\n"
-            "• YouTube is blocking this bot (try updating yt-dlp)\n\n"
+            "• YouTube is blocking this bot (update yt‑dlp)\n\n"
             "Check server logs for full yt-dlp output.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -273,7 +262,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     m, s    = divmod(dur, 60)
 
     await msg.edit_text(
-        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\n⬇️ Downloading best video…",
+        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\n⬇️ Downloading best quality…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -323,7 +312,6 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     logger.error("Unhandled exception: %s", ctx.error, exc_info=ctx.error)
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     s = cookie_summary()
     if s["ok"]:
