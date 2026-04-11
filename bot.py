@@ -28,8 +28,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# Silence Flask/Werkzeug request logs to keep output clean
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -38,7 +36,7 @@ COOKIES_FILE  = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 MAX_SIZE_MB   = int(os.getenv("MAX_SIZE_MB", "50"))
 DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "/tmp/yt_downloads")
 ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
-PORT          = int(os.getenv("PORT", "8080"))   # Render injects $PORT
+PORT          = int(os.getenv("PORT", "8080"))
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -49,39 +47,21 @@ YOUTUBE_REGEX = re.compile(
 )
 
 # ── Quality options ───────────────────────────────────────────────────────────
-# Format strings use multiple fallbacks separated by /  so yt-dlp always finds
-# something even when a specific resolution is not available for that video.
+# Instead of format-filter strings (which fail when HLS/DASH streams don't
+# match), we use format_sort to express the *preference* and always fall back
+# to "best" so yt-dlp never hard-fails on missing streams.
+#
+# Each entry: (label, max_height_or_None, audio_only)
 QUALITY_OPTIONS = [
-    (
-        "🎬 Best (≤1080p)",
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=1080]+bestaudio"
-        "/best[height<=1080]"
-        "/best",
-    ),
-    (
-        "📺 720p",
-        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=720]+bestaudio"
-        "/best[height<=720]"
-        "/best",
-    ),
-    (
-        "📱 480p",
-        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=480]+bestaudio"
-        "/best[height<=480]"
-        "/best",
-    ),
-    (
-        "🔊 Audio only (MP3)",
-        "bestaudio[ext=m4a]/bestaudio/best",
-    ),
+    ("🎬 Best (≤1080p)", 1080,  False),
+    ("📺 720p",           720,   False),
+    ("📱 480p",           480,   False),
+    ("🔊 Audio only MP3", None,  True),
 ]
 
 # ── Player client chain ───────────────────────────────────────────────────────
-# ios and mweb bypass YouTube bot-detection without needing cookies.
-# android is deprecated and triggers "no longer supported" — excluded.
+# ios + mweb return HLS streams — no separate DASH video/audio tracks.
+# That is fine because we no longer use bestvideo+bestaudio format strings.
 PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookie manager ────────────────────────────────────────────────────────────
@@ -99,8 +79,10 @@ def _sanitize_and_validate(src: str) -> str:
     if crlf:
         logger.info("Converted %d CRLF → LF in cookies", crlf)
     lines = [l for l in text.splitlines() if "HTTP Cookie File" not in l]
-    data_lines = [l for l in lines if l.strip() and not l.startswith("#")
-                  and len(l.split("\t")) == 7]
+    data_lines = [
+        l for l in lines
+        if l.strip() and not l.startswith("#") and len(l.split("\t")) == 7
+    ]
     if not data_lines:
         raise ValueError("No valid 7-field cookie lines found")
     clean = NETSCAPE_MAGIC + "\n" + "\n".join(lines) + "\n"
@@ -133,14 +115,14 @@ def cookie_summary() -> dict:
         n = sum(1 for l in lines if l.strip() and not l.startswith("#"))
         return {"ok": True, "count": n}
     return {
-        "ok": False,
-        "src": COOKIES_FILE,
+        "ok":     False,
+        "src":    COOKIES_FILE,
         "exists": os.path.isfile(COOKIES_FILE),
-        "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
+        "size":   os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
     }
 
 
-# ── yt-dlp ────────────────────────────────────────────────────────────────────
+# ── yt-dlp helpers ────────────────────────────────────────────────────────────
 def _base_opts() -> dict:
     opts: dict = {
         "quiet":          True,
@@ -159,26 +141,49 @@ def _base_opts() -> dict:
     return opts
 
 
-def _download_opts(tmpdir: str, fmt: str, audio_only: bool) -> dict:
+def _build_download_opts(tmpdir: str, max_height: int | None, audio_only: bool) -> dict:
+    """
+    Build yt-dlp options that NEVER fail with 'format not available'.
+
+    Key insight:
+      - ios/mweb return HLS (m3u8) streams: single combined video+audio.
+        bestvideo[height<=N]+bestaudio requires DASH separate streams → fails.
+      - Solution: use format="best" + format_sort to express the preference.
+        format_sort="res:N" picks the best stream whose height ≤ N.
+        If no stream matches the sort hint, yt-dlp still picks the best available.
+    """
     opts = _base_opts()
     opts.update({
-        "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
-        "noprogress":          True,
-        "format":              fmt,
+        "outtmpl":          os.path.join(tmpdir, "%(title).80s.%(ext)s"),
+        "noprogress":       True,
         "merge_output_format": "mp4",
-        "postprocessors":      [],
-        "fragment_retries":    5,
-        "continuedl":          True,
-        # Accept any format if the preferred one isn't available
-        "format_sort":         ["res", "ext:mp4:m4a", "tbr", "asr"],
+        "postprocessors":   [],
+        "fragment_retries": 5,
+        "continuedl":       True,
     })
+
     if audio_only:
+        # For audio: grab the best audio stream; ffmpeg converts to mp3
+        opts["format"] = "bestaudio/best"
         opts["postprocessors"].append({
             "key":              "FFmpegExtractAudio",
             "preferredcodec":   "mp3",
             "preferredquality": "192",
         })
         del opts["merge_output_format"]
+
+    elif max_height is not None:
+        # Use format_sort to cap resolution — works with both HLS and DASH.
+        # "res:N" = prefer streams up to N height; never hard-fails.
+        # "ext:mp4" = prefer mp4 container when available.
+        opts["format"]      = "best[ext=mp4]/best"
+        opts["format_sort"] = [f"res:{max_height}", "ext:mp4", "tbr"]
+
+    else:
+        # Best quality — just let yt-dlp pick the top stream
+        opts["format"]      = "best[ext=mp4]/best"
+        opts["format_sort"] = ["res", "ext:mp4", "tbr"]
+
     return opts
 
 
@@ -189,9 +194,9 @@ def fetch_info(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-def download_video(url: str, fmt: str, tmpdir: str) -> Path:
-    audio_only = fmt.startswith("bestaudio")
-    with yt_dlp.YoutubeDL(_download_opts(tmpdir, fmt, audio_only)) as ydl:
+def download_video(url: str, max_height: int | None, audio_only: bool, tmpdir: str) -> Path:
+    opts = _build_download_opts(tmpdir, max_height, audio_only)
+    with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
     candidates = sorted(
         Path(tmpdir).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
@@ -201,37 +206,44 @@ def download_video(url: str, fmt: str, tmpdir: str) -> Path:
     return candidates[0]
 
 
-# ── Flask health-check server ─────────────────────────────────────────────────
+# ── Flask health server ───────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 
-@flask_app.route("/")
-def health():
+@flask_app.get("/")
+def index():
     s = cookie_summary()
-    return jsonify({
-        "status":  "ok",
-        "bot":     "running",
-        "cookies": s,
-        "clients": PLAYER_CLIENTS,
-    })
+    return jsonify({"status": "ok", "cookies": s, "clients": PLAYER_CLIENTS})
 
 
-@flask_app.route("/health")
-def health_check():
+@flask_app.get("/health")
+def health():
     return jsonify({"status": "ok"}), 200
 
 
 def run_flask():
-    logger.info("Flask health server listening on port %d", PORT)
+    logger.info("Flask health server on port %d", PORT)
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
-# ── Keyboards / guards ────────────────────────────────────────────────────────
+# ── Keyboard / auth ───────────────────────────────────────────────────────────
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
+    # Encode max_height and audio_only into callback data
+    def encode(label, max_h, audio):
+        return f"{max_h or 'None'}|{int(audio)}|{url}"
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(lbl, callback_data=f"{fmt}|||{url}")]
-        for lbl, fmt in QUALITY_OPTIONS
+        [InlineKeyboardButton(label, callback_data=encode(label, max_h, audio))]
+        for label, max_h, audio in QUALITY_OPTIONS
     ])
+
+
+def decode_callback(data: str) -> tuple[int | None, bool, str]:
+    parts = data.split("|", 2)
+    max_h  = None if parts[0] == "None" else int(parts[0])
+    audio  = bool(int(parts[1]))
+    url    = parts[2]
+    return max_h, audio, url
 
 
 def is_allowed(update: Update) -> bool:
@@ -242,8 +254,9 @@ def is_allowed(update: Update) -> bool:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\n"
-        "Send me any YouTube link, pick a quality, and I'll send you the file.\n\n"
-        "/start – this message\n/help – tips\n/cookies – auth status\n/refresh – reload cookies",
+        "Send me any YouTube link, pick a quality, and I'll send the file.\n\n"
+        "/start – this message\n/help – tips\n"
+        "/cookies – auth status\n/refresh – reload cookies",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -252,7 +265,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *How to use*\n\n"
         "1. Paste a YouTube URL.\n"
-        "2. Pick quality from the buttons.\n"
+        "2. Pick a quality from the buttons.\n"
         "3. Receive your file!\n\n"
         f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.",
         parse_mode=ParseMode.MARKDOWN,
@@ -263,14 +276,10 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     s = cookie_summary()
-    if s["ok"]:
-        body = f"✅ *Active* — {s['count']} cookies loaded"
-    else:
-        body = (
-            f"❌ *Not loaded*\n"
-            f"File: `{s['src']}`  exists={s['exists']}  size={s['size']} bytes\n"
-            "Run `bash get_cookies.sh chrome` then send /refresh"
-        )
+    body = (
+        f"✅ *Active* — {s['count']} cookies loaded" if s["ok"]
+        else f"❌ *Not loaded*\nFile: `{s['src']}`  exists={s['exists']}  size={s['size']} B"
+    )
     await update.message.reply_text(
         f"🍪 *Cookie Status*\n{body}\n\n"
         f"_Clients: {' → '.join(PLAYER_CLIENTS[:3])} …_",
@@ -287,10 +296,8 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if result:
         await msg.edit_text(f"✅ Reloaded — {s['count']} cookies active")
     else:
-        await msg.edit_text(
-            "❌ Reload failed. Check that `cookies.txt` has valid data.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await msg.edit_text("❌ Reload failed. Check `cookies.txt` has valid data.",
+                            parse_mode=ParseMode.MARKDOWN)
 
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -306,7 +313,8 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, text)
     except yt_dlp.utils.DownloadError as e:
-        await msg.edit_text(f"❌ Could not fetch info:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text(f"❌ Could not fetch info:\n`{e}`",
+                            parse_mode=ParseMode.MARKDOWN)
         return
 
     title   = info.get("title", "Unknown")
@@ -329,12 +337,17 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         return
 
     try:
-        fmt, url = query.data.split("|||", 1)
-    except ValueError:
+        max_height, audio_only, url = decode_callback(query.data)
+    except Exception:
         await query.edit_message_text("❌ Invalid selection.")
         return
 
-    label = next((lbl for lbl, f in QUALITY_OPTIONS if f == fmt), fmt)
+    # Find the label for display
+    label = next(
+        (lbl for lbl, mh, ao in QUALITY_OPTIONS
+         if mh == max_height and ao == audio_only),
+        "Selected quality"
+    )
     await query.edit_message_text(
         f"⬇️ Downloading *{label}*…", parse_mode=ParseMode.MARKDOWN
     )
@@ -342,7 +355,7 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
     try:
         file_path: Path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, url, fmt, tmpdir
+            None, download_video, url, max_height, audio_only, tmpdir
         )
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
@@ -400,15 +413,11 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     s = cookie_summary()
-    if s["ok"]:
-        logger.info("Cookie auth  : ACTIVE — %d entries", s["count"])
-    else:
-        logger.warning("Cookie auth  : DISABLED")
+    logger.info("Cookie auth  : %s", f"ACTIVE — {s['count']} entries" if s["ok"] else "DISABLED")
     logger.info("Player chain : %s", " → ".join(PLAYER_CLIENTS))
 
-    # Start Flask health-check server in a daemon thread
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    # Flask runs in a daemon thread — dies automatically when bot exits
+    threading.Thread(target=run_flask, daemon=True).start()
 
     app = (
         Application.builder()
@@ -418,7 +427,6 @@ def main() -> None:
         .connect_timeout(30)
         .build()
     )
-
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("cookies", cmd_cookies))
