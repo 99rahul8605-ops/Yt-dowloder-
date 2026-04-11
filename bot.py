@@ -7,8 +7,7 @@ import shutil
 import threading
 from pathlib import Path
 import io
-import sys
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 
 from flask import Flask, jsonify
 from telegram import Update
@@ -30,8 +29,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# Silence Flask/Werkzeug request logs
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -49,8 +46,6 @@ YOUTUBE_REGEX = re.compile(
     r"(youtube\.com/(watch\?v=|shorts/|embed/)|youtu\.be/)"
     r"[\w\-]{11}"
 )
-
-PLAYER_CLIENTS = ["ios", "mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
 # ── Cookie manager ────────────────────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
@@ -104,21 +99,23 @@ def cookie_summary() -> dict:
         "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0,
     }
 
-# ── yt-dlp (verbose + ignore config) ─────────────────────────────────────────
+# ── yt-dlp options (working clients, no forced format) ───────────────────────
 def _base_opts() -> dict:
-    """Base options: ignore system config, verbose logging, no format string."""
+    """Base options: ignore config, verbose, and use working YouTube clients."""
     opts: dict = {
-        "ignoreconfig":   True,      # ← CRITICAL: prevent external -f
+        "ignoreconfig":   True,
         "verbose":        True,
         "quiet":          False,
         "no_warnings":    False,
         "socket_timeout": 30,
         "retries":        5,
-        "extractor_args": {
-            "youtube": {
-                "player_client": PLAYER_CLIENTS,
-            }
-        },
+        # Do NOT force player_client – let yt-dlp use its default (android, web)
+        # If you want to be explicit, use ["web", "mweb"] (both work well)
+        # "extractor_args": {
+        #     "youtube": {
+        #         "player_client": ["web", "mweb"],
+        #     }
+        # },
     }
     cp = load_cookies()
     if cp:
@@ -126,11 +123,13 @@ def _base_opts() -> dict:
     return opts
 
 def _download_opts(tmpdir: str) -> dict:
+    """Download options: flexible format sorting, fallback if H.264 missing."""
     opts = _base_opts()
     opts.update({
         "outtmpl":             os.path.join(tmpdir, "%(title).80s.%(ext)s"),
         "noprogress":          False,
-        "format_sort":         ["vcodec:h264", "res", "acodec:aac"],
+        # Prefer H.264 + AAC, but allow other codecs if necessary
+        "format_sort":         ["res", "vcodec:h264", "acodec:aac", "vcodec", "acodec"],
         "merge_output_format": "mp4",
         "fragment_retries":    5,
         "continuedl":          True,
@@ -139,11 +138,9 @@ def _download_opts(tmpdir: str) -> dict:
     return opts
 
 def fetch_info_with_logs(url: str) -> tuple[dict, str]:
-    """Return (info_dict, verbose_logs). Captures yt-dlp's stderr output."""
     opts = _base_opts()
     opts["skip_download"] = True
     log_capture = io.StringIO()
-    # Redirect stderr (where yt-dlp prints verbose logs) to our buffer
     with redirect_stderr(log_capture):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -172,7 +169,6 @@ def health():
         "status":  "ok",
         "bot":     "running",
         "cookies": s,
-        "clients": PLAYER_CLIENTS,
     })
 
 @flask_app.route("/health")
@@ -191,7 +187,7 @@ def is_allowed(update: Update) -> bool:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\n"
-        "Send me any YouTube link, and I'll download the best H.264 video + AAC audio.\n\n"
+        "Send me any YouTube link, and I'll download the best available video (preferring H.264).\n\n"
         "/start – this message\n/help – tips\n/cookies – auth status\n/refresh – reload cookies",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -202,7 +198,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "1. Paste a YouTube URL.\n"
         "2. Wait for the download and upload.\n"
         "3. Enjoy your video!\n\n"
-        f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.",
+        f"⚠️ Files over *{MAX_SIZE_MB} MB* cannot be sent via Telegram.\n\n"
+        "If you get errors, try refreshing cookies (/refresh) or use a fresh cookies.txt.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -220,7 +217,7 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await update.message.reply_text(
         f"🍪 *Cookie Status*\n{body}\n\n"
-        f"_Clients: {' → '.join(PLAYER_CLIENTS[:3])} …_",
+        "_Tip: Expired cookies cause 'Precondition check failed' errors._",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -252,17 +249,20 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         info, ytdlp_logs = await asyncio.get_event_loop().run_in_executor(
             None, fetch_info_with_logs, text
         )
-        # Log the verbose output (visible on server console)
-        logger.info("yt-dlp fetch logs:\n%s", ytdlp_logs[:2000])  # trim if huge
+        # Log the first 2000 chars of verbose output for debugging
+        logger.info("yt-dlp fetch logs (first 2000 chars):\n%s", ytdlp_logs[:2000])
     except Exception as e:
-        # Try to get the log even on failure
         error_msg = str(e)
-        # The logs are already captured inside fetch_info_with_logs if it raised,
-        # but we need to re-raise with the logs. Simpler: we can call again and catch.
-        # For brevity, we just show the error.
+        logger.error(f"Fetch info failed: {error_msg}")
+        # Try to show a helpful message
         await msg.edit_text(
-            f"❌ Could not fetch info:\n`{error_msg}`\n\n"
-            "Check server logs for full yt-dlp verbose output.",
+            f"❌ Could not fetch video info.\n"
+            f"Error: `{error_msg}`\n\n"
+            "Possible causes:\n"
+            "• Expired cookies – try `/refresh`\n"
+            "• Video is private/age‑restricted\n"
+            "• YouTube is blocking this bot (try updating yt-dlp)\n\n"
+            "Check server logs for full yt-dlp output.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -273,7 +273,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     m, s    = divmod(dur, 60)
 
     await msg.edit_text(
-        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\n⬇️ Downloading best H.264 video…",
+        f"🎬 *{title}*\n👤 {channel}  ⏱ {m}:{s:02d}\n\n⬇️ Downloading best video…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -282,13 +282,13 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         file_path, dl_logs = await asyncio.get_event_loop().run_in_executor(
             None, download_video_with_logs, text, tmpdir
         )
-        logger.info("yt-dlp download logs:\n%s", dl_logs[:2000])
+        logger.info("yt-dlp download logs (first 2000 chars):\n%s", dl_logs[:2000])
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_SIZE_MB:
             await msg.edit_text(
                 f"❌ File is *{size_mb:.1f} MB* — over the {MAX_SIZE_MB} MB Telegram limit.\n"
-                "Try a lower quality manually (e.g., add `?format=best[height<=480]` to URL).",
+                "Try a lower quality by adding `?format=best[height<=480]` to the URL.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -330,7 +330,6 @@ def main() -> None:
         logger.info("Cookie auth  : ACTIVE — %d entries", s["count"])
     else:
         logger.warning("Cookie auth  : DISABLED")
-    logger.info("Player chain : %s", " → ".join(PLAYER_CLIENTS))
 
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
