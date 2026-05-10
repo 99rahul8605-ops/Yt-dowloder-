@@ -51,7 +51,7 @@ QUALITY_OPTIONS = [
 
 PLAYER_CLIENTS = ["mweb", "android_testsuite", "android_vr", "web_creator", "web"]
 
-# ── Cookies ───────────────────────────────────────────────────────────────────
+# ── Cookies ─────────────────────────────────────────────────────────────
 NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
 _sanitized_path: str | None = None
 
@@ -94,7 +94,7 @@ def cookie_summary() -> dict:
             "exists": os.path.isfile(COOKIES_FILE),
             "size": os.path.getsize(COOKIES_FILE) if os.path.isfile(COOKIES_FILE) else 0}
 
-# ── ffprobe helper ────────────────────────────────────────────────────────────
+# ── ffprobe helper ──────────────────────────────────────────────────────────
 def ffprobe_info(path: str) -> dict:
     """Use ffprobe to read codec/resolution/duration of a downloaded file."""
     cmd = [
@@ -124,12 +124,22 @@ def _ydl_base_opts() -> dict:
         "quiet":          True,
         "no_warnings":    True,
         "socket_timeout": 30,
-        "retries":        5,
+        "retries":        10,
         "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
+        # Anti-bot detection measures
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "http_headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+            "DNT": "1",
+        },
     }
     cp = load_cookies()
     if cp:
         opts["cookiefile"] = cp
+        logger.info("Using authentication cookies from: %s", cp)
+    else:
+        logger.warning("No cookies loaded - YouTube may require authentication")
     return opts
 
 def fetch_info(url: str) -> dict:
@@ -159,6 +169,9 @@ def get_stream_urls(url: str, max_height: int | None, audio_only: bool) -> dict:
     # Filter out untested / DRM / unplayable formats
     fmts = [f for f in fmts if f.get("url") and not f.get("drm")]
 
+    if not fmts:
+        raise RuntimeError("No playable formats found. Video may be age-restricted or unavailable in your region.")
+
     if audio_only:
         # Pick best audio stream
         audio_fmts = [f for f in fmts if f.get("acodec") != "none"
@@ -166,6 +179,8 @@ def get_stream_urls(url: str, max_height: int | None, audio_only: bool) -> dict:
         if not audio_fmts:
             audio_fmts = fmts  # fallback: any stream
         audio_fmts.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+        if not audio_fmts[0].get("url"):
+            raise RuntimeError("No playable audio format with valid URL found")
         return {"combined_url": audio_fmts[0]["url"], "title": title, "ext": "mp3"}
 
     # Separate video+audio (DASH)
@@ -190,9 +205,15 @@ def get_stream_urls(url: str, max_height: int | None, audio_only: bool) -> dict:
             reverse=True,
         )
         audio_fmts.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+        
+        video_url = video_fmts[0].get("url")
+        audio_url = audio_fmts[0].get("url")
+        if not video_url or not audio_url:
+            raise RuntimeError("Selected formats have no valid streaming URLs")
+        
         return {
-            "video_url": video_fmts[0]["url"],
-            "audio_url": audio_fmts[0]["url"],
+            "video_url": video_url,
+            "audio_url": audio_url,
             "title":     title,
             "ext":       "mp4",
         }
@@ -208,9 +229,14 @@ def get_stream_urls(url: str, max_height: int | None, audio_only: bool) -> dict:
         if under:
             combined = under
     combined.sort(key=lambda f: f.get("height") or 0, reverse=True)
-    return {"combined_url": combined[0]["url"], "title": title, "ext": "mp4"}
+    
+    combined_url = combined[0].get("url")
+    if not combined_url:
+        raise RuntimeError("No valid streaming URL found in available formats")
+    
+    return {"combined_url": combined_url, "title": title, "ext": "mp4"}
 
-# ── ffmpeg download ───────────────────────────────────────────────────────────
+# ── ffmpeg download ────────────────────────────────────────────────────────
 def ffmpeg_download(stream: dict, outdir: str) -> Path:
     """
     Use ffmpeg directly to download and encode the stream.
@@ -289,7 +315,7 @@ def download_video(url: str, max_height: int | None, audio_only: bool, tmpdir: s
     logger.info("Stream type: %s", "DASH" if "video_url" in stream else "combined/HLS")
     return ffmpeg_download(stream, tmpdir)
 
-# ── Flask ─────────────────────────────────────────────────────────────────────
+# ── Flask ─────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.get("/")
@@ -333,7 +359,7 @@ def decode_cb(data: str) -> tuple[int | None, bool, str]:
 def is_allowed(u: Update) -> bool:
     return not ALLOWED_USERS or str(u.effective_user.id) in ALLOWED_USERS
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Handlers ───────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *YouTube Downloader Bot*\n\nSend me a YouTube link, pick quality, get the file.\n\n"
@@ -374,7 +400,18 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, fetch_info, text)
     except yt_dlp.utils.DownloadError as e:
-        await msg.edit_text(f"❌ `{e}`", parse_mode=ParseMode.MARKDOWN)
+        error_msg = str(e)
+        if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
+            await msg.edit_text(
+                "⚠️ YouTube requires authentication.\n\n"
+                "The bot needs fresh cookies. Ask the owner to:\n"
+                "1. Export fresh cookies from their YouTube browser\n"
+                "2. Update the cookies.txt file\n"
+                "3. Restart the bot",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await msg.edit_text(f"❌ `{error_msg[:200]}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     title = info.get("title", "Unknown")
@@ -439,8 +476,9 @@ async def handle_quality_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
     except Exception as e:
         logger.exception("Download/upload failed")
+        error_msg = str(e)
         await query.edit_message_text(
-            f"❌ `{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN
+            f"❌ `{type(e).__name__}: {error_msg[:150]}`", parse_mode=ParseMode.MARKDOWN
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -451,7 +489,7 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     logger.error("Error: %s", ctx.error, exc_info=ctx.error)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────
 def main() -> None:
     s = cookie_summary()
     logger.info("Cookies : %s", f"ACTIVE {s['count']} entries" if s["ok"] else "DISABLED")
