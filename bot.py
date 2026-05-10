@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import threading
 import subprocess
+import base64
 from pathlib import Path
 
 from flask import Flask, jsonify
@@ -73,6 +74,21 @@ def load_cookies(force=False) -> str | None:
     global _sanitized_path
     if _sanitized_path and not force:
         return _sanitized_path
+    
+    # Try to load from base64 environment variable first
+    cookies_b64 = os.getenv("COOKIES_BASE64")
+    if cookies_b64:
+        try:
+            cookies_data = base64.b64decode(cookies_b64).decode('utf-8')
+            dst = "/tmp/_yt_bot_cookies.txt"
+            Path(dst).write_text(cookies_data, encoding='utf-8')
+            _sanitized_path = dst
+            logger.info("Cookies loaded from COOKIES_BASE64 environment variable")
+            return _sanitized_path
+        except Exception as e:
+            logger.error("Failed to decode COOKIES_BASE64: %s", e)
+    
+    # Fallback to file path
     if not os.path.isfile(COOKIES_FILE) or os.path.getsize(COOKIES_FILE) == 0:
         logger.warning("No cookies at %s", COOKIES_FILE)
         return None
@@ -406,7 +422,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "⚠️ YouTube requires authentication.\n\n"
                 "The bot needs fresh cookies. Ask the owner to:\n"
                 "1. Export fresh cookies from their YouTube browser\n"
-                "2. Update the cookies.txt file\n"
+                "2. Update the COOKIES_BASE64 environment variable\n"
                 "3. Restart the bot",
                 parse_mode=ParseMode.MARKDOWN
             )
